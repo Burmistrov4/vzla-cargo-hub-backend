@@ -2,9 +2,14 @@ import re
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
-
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PlaywrightTimeoutError = Exception
+    sync_playwright = None
+    PLAYWRIGHT_AVAILABLE = False
 
 OWC_TARIFFS_URL = "https://onewaycargo.net/tarifas"
 
