@@ -1,5 +1,7 @@
-import os
 from dotenv import load_dotenv
+# Justo después de load_dotenv()
+import os
+print(f"DEBUG: URL de Supabase detectada: {os.getenv('SUPABASE_URL')}")
 from supabase import create_client, Client
 
 # Carga variables desde .env si el archivo existe (útil para desarrollo local)
