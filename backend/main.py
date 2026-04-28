@@ -28,6 +28,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://vzla-cargo-hub-frontend.vercel.app",
+        "https://vzla-cargo-hub-backend-production.up.railway.app",
+        "https://vzla-cargo-hub-api.onrender.com",
     ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
