@@ -1,31 +1,35 @@
-from dotenv import load_dotenv
-# Justo después de load_dotenv()
 import os
-print(f"DEBUG: URL de Supabase detectada: {os.getenv('SUPABASE_URL')}")
+from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# Carga variables desde .env si el archivo existe (útil para desarrollo local)
+# Intentar cargar .env (solo para local)
 load_dotenv()
 
-# Obtener variables de entorno
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+# Obtener variables
+url = os.getenv("SUPABASE_URL")
+key = os.getenv("SUPABASE_PUBLISHABLE_KEY")
+service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Validación de seguridad: Verifica que las variables esenciales existan
-if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
-    # En Railway, esto se verá en los logs si olvidaste configurar una variable
-    print("❌ ERROR: No se encontraron las variables de entorno de Supabase.")
-    print("Asegúrate de que SUPABASE_URL y SUPABASE_PUBLISHABLE_KEY estén configuradas.")
+# Inicializar como None por defecto
+supabase_public = None
+supabase_admin = None
+
+# Verificación Robusta
+if url and key:
+    try:
+        supabase_public = create_client(url, key)
+        print("✅ Cliente Público de Supabase conectado.")
+    except Exception as e:
+        print(f"❌ Error al inicializar cliente público: {e}")
 else:
-    print("✅ Conexión con Supabase configurada correctamente.")
+    print("❌ ERROR CRÍTICO: SUPABASE_URL o KEY no detectadas en el entorno.")
 
-# Inicialización del cliente público (para operaciones estándar)
-supabase_public: Client = None
-if SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY:
-    supabase_public = create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+if url and service_key:
+    try:
+        supabase_admin = create_client(url, service_key)
+        print("✅ Cliente Admin de Supabase conectado.")
+    except Exception as e:
+        print(f"❌ Error al inicializar cliente admin: {e}")
 
-# Inicialización del cliente admin (solo si la Service Role Key está presente)
-supabase_admin: Client = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+# Esto evita que main.py falle al importar
+db_client = supabase_admin or supabase_public
