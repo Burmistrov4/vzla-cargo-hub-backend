@@ -374,6 +374,21 @@ def build_zoom_rules(courier_id: str, region: str):
     rows = get_courier_business_rules(courier_id)
 
     return {
+        "air_rate_usd_per_kg": get_rule_number(
+            rows, "air_rate_usd_per_kg", "air", region, 32.40
+        ),
+        "billable_weight_step_kg": get_rule_number(
+            rows, "billable_weight_step_kg", "air", region, 0.5
+        ),
+        "protection_percent": get_rule_number(
+            rows, "protection_percent", "air", "*", 0.01
+        ),
+        "protection_min_usd": get_rule_number(
+            rows, "protection_min_usd", "air", "*", 1.20
+        ),
+        "consolidation_fee_usd": get_rule_number(
+            rows, "consolidation_fee_usd", "air", "*", 6.00
+        ),
         "air_rate_usd_per_half_kg": get_rule_number(
             rows, "air_rate_usd_per_half_kg", "air", region, 6
         ),
@@ -445,6 +460,11 @@ def build_quote_result(payload):
             "source": "courier_business_rules",
             "service_type": payload.service_type,
             "region": region,
+            "air_rate_usd_per_kg": zoom_rules["air_rate_usd_per_kg"],
+            "billable_weight_step_kg": zoom_rules["billable_weight_step_kg"],
+            "protection_percent": zoom_rules["protection_percent"],
+            "protection_min_usd": zoom_rules["protection_min_usd"],
+            "consolidation_fee_usd": zoom_rules["consolidation_fee_usd"],
             "air_rate_usd_per_half_kg": zoom_rules["air_rate_usd_per_half_kg"],
             "sea_rate_usd_per_ft3": zoom_rules["sea_rate_usd_per_ft3"],
             "handling_fee_usd": zoom_rules["handling_fee_usd"],
@@ -520,6 +540,8 @@ def exchange_rate_latest():
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -629,6 +651,8 @@ def list_shipments(
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -661,6 +685,8 @@ def get_shipment_detail(shipment_id: str):
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -679,6 +705,8 @@ def get_shipment_items(shipment_id: str):
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -838,6 +866,8 @@ def quote_calculate(payload: QuoteCalculateRequest):
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -952,5 +982,7 @@ def quote_calculate_and_save(payload: QuoteSaveRequest):
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

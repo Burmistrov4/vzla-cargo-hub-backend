@@ -308,6 +308,193 @@ def calculate_quote(
     }
 
 
+def calculate_zoom_quote(
+    rules: dict,
+    exchange_rate: float,
+    payload: dict,
+):
+    """
+    Motor observado para Zoom Casillero Internacional.
+
+    Alcance v1:
+    - Casillero Internacional;
+    - Estados Unidos -> Venezuela;
+    - Aereo;
+    - Mercancia;
+    - Entrega en oficina.
+    """
+
+    bcv = d(exchange_rate)
+    items = payload.get("items") or []
+
+    service_type = payload["service_type"]
+    declared_value_usd = d(payload.get("declared_value_usd", 0))
+    delivery_type = payload.get("delivery_type", "office")
+    zoom_service = payload.get("zoom_service", "international_locker")
+    origin_country = payload.get("origin_country", "US")
+    destination_country = payload.get("destination_country", "VE")
+    shipment_kind = payload.get("shipment_kind", "merchandise")
+    consolidated = bool(payload.get("consolidated", False))
+    consolidated_package_count = int(payload.get("consolidated_package_count", 1) or 1)
+    use_protection = bool(payload.get("use_protection", True))
+
+    total_weight_lb_input = d(payload.get("total_weight_lb", 0))
+    total_weight_kg_input = d(payload.get("total_weight_kg", 0))
+    total_volume_ft3_input = d(payload.get("total_volume_ft3", 0))
+
+    length_in_input = d(payload.get("length_in", 0))
+    width_in_input = d(payload.get("width_in", 0))
+    height_in_input = d(payload.get("height_in", 0))
+
+    if zoom_service != "international_locker":
+        raise ValueError("Zoom solo soporta Casillero Internacional en esta version")
+    if origin_country != "US" or destination_country != "VE":
+        raise ValueError("Zoom Casillero v1 solo soporta Estados Unidos -> Venezuela")
+    if service_type != "air":
+        raise ValueError("Zoom Casillero v1 solo soporta servicio aereo")
+    if delivery_type != "office":
+        raise ValueError("Zoom Casillero v1 solo soporta entrega en oficina")
+    if shipment_kind != "merchandise":
+        raise ValueError("Zoom Casillero v1 solo soporta mercancia")
+    if consolidated and consolidated_package_count < 2:
+        raise ValueError("Si consolidated=true, consolidated_package_count debe ser al menos 2")
+    if consolidated and consolidated_package_count != 2:
+        raise ValueError("Zoom Casillero v1 solo tiene validado consolidado con 2 encomiendas")
+
+    air_rate_usd_per_kg = d(rules.get("air_rate_usd_per_kg", "32.40"))
+    protection_percent = d(rules.get("protection_percent", "0.01"))
+    protection_min_usd = d(rules.get("protection_min_usd", "1.20"))
+    consolidation_fee_usd = d(rules.get("consolidation_fee_usd", "6.00"))
+    billable_weight_step_kg = d(rules.get("billable_weight_step_kg", "0.5"))
+
+    total_weight_lb = derive_weight_lb(
+        total_weight_lb=total_weight_lb_input,
+        total_weight_kg=total_weight_kg_input,
+        items=items,
+    )
+
+    total_weight_kg = (
+        total_weight_kg_input
+        if total_weight_kg_input > 0
+        else (total_weight_lb / LB_PER_KG if total_weight_lb > 0 else ZERO)
+    )
+
+    if total_weight_kg <= 0:
+        raise ValueError("Zoom requiere peso fisico mayor a 0 kg")
+
+    length_in, width_in, height_in = derive_package_dimensions(
+        length_in=length_in_input,
+        width_in=width_in_input,
+        height_in=height_in_input,
+        items=items,
+    )
+
+    raw_volume_ft3 = derive_volume_ft3(
+        total_volume_ft3=total_volume_ft3_input,
+        length_in=length_in,
+        width_in=width_in,
+        height_in=height_in,
+        items=items,
+    )
+
+    raw_volumetric_lb = ZERO
+    billable_weight_kg = round_up_to_step(total_weight_kg, billable_weight_step_kg)
+    chargeable_exact = billable_weight_kg * LB_PER_KG
+    chargeable_display = round_usd(billable_weight_kg)
+    storage_chargeable_ft3 = ZERO
+
+    freight_usd = billable_weight_kg * air_rate_usd_per_kg
+    freight_ves = freight_usd * bcv if bcv > 0 else ZERO
+
+    protection_usd = ZERO
+    if use_protection and declared_value_usd > 0:
+        calculated_protection = declared_value_usd * protection_percent
+        protection_usd = (
+            protection_min_usd
+            if calculated_protection < protection_min_usd
+            else calculated_protection
+        )
+    protection_ves = protection_usd * bcv
+
+    consolidation_usd = consolidation_fee_usd if consolidated else ZERO
+    consolidation_ves = consolidation_usd * bcv
+
+    total_usd = freight_usd + protection_usd + consolidation_usd
+    total_ves = total_usd * bcv if bcv > 0 else ZERO
+
+    return {
+        "engine": "zoom_locker_air_office_v1",
+        "observed_formula_version": "zoom_locker_air_office_v1",
+        "service_type": service_type,
+        "charge_unit": "kg",
+        "chargeable_units_exact": float(chargeable_exact),
+        "chargeable_units_display": chargeable_display,
+        "uses_minimum_charge": False,
+        "exchange_rate_used": float(bcv),
+        "raw_metrics": {
+            "real_weight_lb": round_usd(total_weight_lb),
+            "volumetric_weight_lb": round_usd(raw_volumetric_lb),
+            "raw_volume_ft3": round_usd(raw_volume_ft3),
+            "display_volume_ft3": round_usd(raw_volume_ft3),
+            "storage_chargeable_ft3": round_usd(storage_chargeable_ft3),
+            "length_in_used": round_usd(length_in),
+            "width_in_used": round_usd(width_in),
+            "height_in_used": round_usd(height_in),
+            "physical_weight_kg": round_usd(total_weight_kg),
+            "billable_weight_kg": round_usd(billable_weight_kg),
+        },
+        "flags": {
+            "zoom_mode": True,
+            "zoom_service": zoom_service,
+            "origin_country": origin_country,
+            "destination_country": destination_country,
+            "shipment_kind": shipment_kind,
+            "delivery_type": delivery_type,
+            "consolidated": consolidated,
+            "consolidated_package_count": consolidated_package_count,
+            "use_protection": use_protection,
+            "zoom_billing_basis": "kg_rounded_up_to_0.5",
+            "air_basis": "zoom_observed_kg_rate",
+            "rate_source": "zoom_observed_cases",
+        },
+        "public_calculator_reference": {
+            "air_rate_usd_per_kg": round_usd(air_rate_usd_per_kg),
+            "billable_weight_step_kg": round_usd(billable_weight_step_kg),
+            "protection_percent": round_usd(protection_percent),
+            "protection_min_usd": round_usd(protection_min_usd),
+            "consolidation_fee_usd": round_usd(consolidation_fee_usd),
+            "exchange_rate": float(bcv),
+        },
+        "breakdown": {
+            "freight_usd": round_usd(freight_usd),
+            "freight_ves": round_usd(freight_ves),
+            "protection_usd": round_usd(protection_usd),
+            "protection_ves": round_usd(protection_ves),
+            "consolidation_usd": round_usd(consolidation_usd),
+            "consolidation_ves": round_usd(consolidation_ves),
+            "exchange_rate": float(bcv),
+            "insurance_usd": round_usd(protection_usd),
+            "insurance_ves": round_usd(protection_ves),
+            "customs_tax_usd": 0,
+            "customs_tax_ves": 0,
+            "handling_usd": 0,
+            "handling_ves": 0,
+            "packaging_usd": 0,
+            "packaging_ves": 0,
+            "repack_usd": 0,
+            "repack_ves": 0,
+            "storage_usd": 0,
+            "storage_ves": 0,
+            "purchase_service_usd": 0,
+            "purchase_service_ves": 0,
+            "compactation_fee_usd": 0,
+            "compactation_fee_ves": 0,
+        },
+        "total_usd": round_usd(total_usd),
+        "total_ves": round_usd(total_ves),
+    }
+
+
 def calculate_owc_quote(
     rules: dict,
     exchange_rate: float,
@@ -627,7 +814,7 @@ def calculate_owc_quote(
     }
 
 
-def calculate_zoom_quote(
+def calculate_zoom_quote_legacy(
     rules: dict,
     exchange_rate: float,
     payload: dict,

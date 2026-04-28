@@ -7,6 +7,9 @@ CourierCode = Literal["zoom", "owc"]
 DeliveryType = Literal["office", "delivery", "home"]
 RegionType = Literal["region_central", "resto_pais"]
 HoldModeType = Literal["none", "general", "repack"]
+ZoomServiceType = Literal["international_locker"]
+ZoomCountryType = Literal["US", "VE"]
+ZoomShipmentKindType = Literal["merchandise", "document"]
 
 
 class QuoteItem(BaseModel):
@@ -62,6 +65,14 @@ class QuoteCalculateRequest(BaseModel):
     apply_provisional_customs: bool = True
 
     storage_fee_ves_per_day_ft3_override: float | None = Field(default=None, ge=0)
+
+    zoom_service: ZoomServiceType = "international_locker"
+    origin_country: ZoomCountryType = "US"
+    destination_country: ZoomCountryType = "VE"
+    shipment_kind: ZoomShipmentKindType = "merchandise"
+    consolidated: bool = False
+    consolidated_package_count: int = Field(default=1, ge=1)
+    use_protection: bool = True
 
     items: list[QuoteItem] = Field(default_factory=list)
 
