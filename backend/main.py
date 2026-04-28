@@ -1,4 +1,5 @@
 from datetime import datetime
+import logging
 from uuid import uuid4
 from typing import Literal
 
@@ -21,6 +22,8 @@ from backend.models import (
     QuoteSaveResponse,
     RestrictedItemMatch,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Vzla Cargo Hub API")
 app.add_middleware(
@@ -523,6 +526,7 @@ def refresh_owc_rates(region: str = "region_central"):
     try:
         return refresh_owc_business_rules(db_client, region=region)
     except Exception as e:
+        logger.exception("Error refrescando tarifas OWC region=%s", region)
         raise HTTPException(status_code=500, detail=str(e))
 
 

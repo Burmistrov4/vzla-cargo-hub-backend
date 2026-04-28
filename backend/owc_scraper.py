@@ -1,21 +1,42 @@
 import re
+import logging
+from html import unescape
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
-
-try:
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PlaywrightTimeoutError = Exception
-    sync_playwright = None
-    PLAYWRIGHT_AVAILABLE = False
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 OWC_TARIFFS_URL = "https://onewaycargo.net/tarifas"
+OWC_TARIFFS_SOURCE_URL = "https://onewaycargo.net/tarifas#calculadora"
+logger = logging.getLogger(__name__)
 
 REGION_TAB_TEXT = {
     "region_central": "Región central",
     "resto_pais": "Resto del país",
+}
+
+REGION_COUNTER_IDS = {
+    "region_central": {
+        "air": "aereoCentral",
+        "sea": "maritimoRegularCentral",
+        "correspondence": "correspondenciaCentral",
+    },
+    "resto_pais": {
+        "air": "aereoRestoDelPais",
+        "sea": "maritimoRegularRestoDelPais",
+        "correspondence": "correspondenciaRestoDelPais",
+    },
+}
+
+REGION_MINIMUMS = {
+    "region_central": {
+        "air_min_lb": Decimal("1"),
+        "sea_min_ft3": Decimal("1"),
+    },
+    "resto_pais": {
+        "air_min_lb": Decimal("6"),
+        "sea_min_ft3": Decimal("2"),
+    },
 }
 
 
@@ -41,35 +62,25 @@ def _normalize_number_string(raw: str) -> str:
     raw = raw.strip()
     raw = raw.replace("Bs", "").replace("$", "").replace("USD", "").strip()
 
-    # Si tiene ambos, inferimos separador decimal por el último
     if "." in raw and "," in raw:
         if raw.rfind(",") > raw.rfind("."):
-            # 1.234,56
             raw = raw.replace(".", "").replace(",", ".")
         else:
-            # 1,234.56
             raw = raw.replace(",", "")
         return raw
 
-    # Solo coma
     if "," in raw:
         parts = raw.split(",")
         if len(parts) == 2 and len(parts[1]) in (1, 2, 3, 4, 5, 6, 7, 8):
-            # Puede ser decimal o millares; si la parte decimal es muy larga lo tratamos como decimal
-            # Para tarifas públicas OWC normalmente 4.253 / 29.967 se ven con punto, pero por robustez:
             if len(parts[1]) > 3:
                 return raw.replace(".", "").replace(",", ".")
-            # 4,253 probablemente significa 4253, no 4.253
             return raw.replace(",", "")
         return raw.replace(",", "")
 
-    # Solo punto
     if "." in raw:
         parts = raw.split(".")
         if len(parts) == 2 and len(parts[1]) > 3:
-            # caso raro tipo 483.33790000
             return raw
-        # 4.253 => 4253
         return raw.replace(".", "")
 
     return raw
@@ -92,84 +103,95 @@ def _extract_all_decimals(pattern: str, text: str) -> list[Decimal]:
     return [_to_decimal(m) for m in matches]
 
 
-def _extract_region_text_from_rendered_page(region: str) -> str:
-    """
-    Usa Playwright porque el HTML inicial de OWC llega con 0 Bs.
-    Necesitamos el texto ya renderizado en navegador.
-    """
-    tab_text = REGION_TAB_TEXT.get(region, "Región central")
+def _fetch_tariffs_html() -> str:
+    try:
+        request = Request(
+            OWC_TARIFFS_SOURCE_URL,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                )
+            },
+        )
+        with urlopen(request, timeout=30) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.read().decode(charset, errors="replace")
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise RuntimeError(f"No se pudo descargar la página de tarifas OWC: {exc}") from exc
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1440, "height": 2200})
 
-        try:
-            page.goto(OWC_TARIFFS_URL, wait_until="networkidle", timeout=30000)
+def _html_to_text(html: str) -> str:
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return _clean_spaces(unescape(text))
 
-            # Esperamos que la página de tarifas cargue algo útil
-            page.wait_for_timeout(1500)
 
-            # Intentamos seleccionar la región correcta
-            try:
-                page.locator(f"text={tab_text}").first.click(timeout=4000)
-                page.wait_for_timeout(1200)
-            except Exception:
-                # si no logra hacer click, seguimos con lo visible
-                pass
+def _extract_counter_decimal(html: str, element_id: str) -> Decimal | None:
+    patterns = [
+        rf"counter\(\s*['\"]#{re.escape(element_id)}['\"]\s*,\s*([\d\.,]+)\s*\)",
+        rf"counter\(\s*['\"]{re.escape(element_id)}['\"]\s*,\s*([\d\.,]+)\s*\)",
+    ]
+    values: list[Decimal] = []
 
-            body_text = page.locator("body").inner_text()
-            return _clean_spaces(body_text)
+    for pattern in patterns:
+        values.extend(_extract_all_decimals(pattern, html))
 
-        except PlaywrightTimeoutError as e:
-            raise RuntimeError(f"Timeout cargando OWC: {e}") from e
-        finally:
-            browser.close()
+    positive_values = [value for value in values if value > 0]
+    if positive_values:
+        return max(positive_values)
+    if values:
+        return values[-1]
+    return None
+
+
+def _extract_handling_fee(text: str) -> Decimal | None:
+    handling_matches = _extract_all_decimals(
+        r"Handling Fee de\s+([\d\.,]+)\s*Bs",
+        text,
+    )
+    return handling_matches[0] if handling_matches else None
 
 
 def scrape_owc_public_rates(region: str = "region_central") -> dict[str, Any]:
     """
-    Extrae tarifas públicas visibles de OWC desde la página renderizada.
+    Extrae tarifas públicas de OWC desde los valores counter(...) embebidos
+    en la página oficial.
     """
-    rendered_text = _extract_region_text_from_rendered_page(region)
+    if region not in REGION_COUNTER_IDS:
+        raise ValueError(f"Región OWC inválida: {region}")
 
-    # Patrones principales
-    air_rate = _extract_first_decimal(
-        r"A[ÉE]REO\s+Desde\s+([\d\.,]+)\s*Bs\s+por libra",
-        rendered_text,
-    )
-    sea_rate = _extract_first_decimal(
-        r"MAR[ÍI]TIMO\s+Desde\s+([\d\.,]+)\s*Bs\s+por pie c[úu]bico",
-        rendered_text,
-    )
-    correspondence_rate = _extract_first_decimal(
-        r"CORRESPONDENCIA\s+Tarifa [úu]nica\s+([\d\.,]+)\s*Bs\s+por env[íi]o",
-        rendered_text,
-    )
+    html = _fetch_tariffs_html()
+    page_text = _html_to_text(html)
+    counter_ids = REGION_COUNTER_IDS[region]
 
-    handling_matches = _extract_all_decimals(
-        r"Handling Fee de\s+([\d\.,]+)\s*Bs",
-        rendered_text,
-    )
-    handling_fee = handling_matches[0] if handling_matches else None
-
-    # Mínimos regionales opcionales
-    air_min_lb = _extract_first_decimal(
-        r"A[ÉE]REO.*?M[íi]nimo requerido por env[íi]o de\s+([\d\.,]+)\s*libras",
-        rendered_text,
-    )
-    sea_min_ft3 = _extract_first_decimal(
-        r"MAR[ÍI]TIMO.*?M[íi]nimo requerido por env[íi]o de\s+([\d\.,]+)\s*pie",
-        rendered_text,
-    )
+    air_rate = _extract_counter_decimal(html, counter_ids["air"])
+    sea_rate = _extract_counter_decimal(html, counter_ids["sea"])
+    correspondence_rate = _extract_counter_decimal(html, counter_ids["correspondence"])
+    handling_fee = _extract_handling_fee(page_text)
+    air_min_lb = REGION_MINIMUMS[region]["air_min_lb"]
+    sea_min_ft3 = REGION_MINIMUMS[region]["sea_min_ft3"]
 
     public_rates_available = all(
-        value is not None
+        value is not None and value > 0
         for value in [air_rate, sea_rate, correspondence_rate, handling_fee]
     )
 
-    result = {
+    if not public_rates_available:
+        logger.warning(
+            "OWC scraping incompleto para %s: air=%s sea=%s correspondence=%s handling=%s",
+            region,
+            air_rate,
+            sea_rate,
+            correspondence_rate,
+            handling_fee,
+        )
+
+    return {
         "courier_code": "owc",
-        "url": OWC_TARIFFS_URL,
+        "url": OWC_TARIFFS_SOURCE_URL,
         "region": region,
         "air_rate_ves_lb": _round_2(air_rate) if air_rate is not None else None,
         "sea_rate_ves_ft3": _round_2(sea_rate) if sea_rate is not None else None,
@@ -178,16 +200,14 @@ def scrape_owc_public_rates(region: str = "region_central") -> dict[str, Any]:
         "air_min_lb": _round_2(air_min_lb) if air_min_lb is not None else None,
         "sea_min_ft3": _round_2(sea_min_ft3) if sea_min_ft3 is not None else None,
         "public_rates_available": public_rates_available,
-        "raw_text_excerpt": rendered_text[:2500],
+        "raw_text_excerpt": page_text[:2500],
         "message": (
             "Tarifas públicas OWC extraídas correctamente"
             if public_rates_available
             else "No se pudieron extraer todas las tarifas públicas OWC"
         ),
-        "engine": "playwright_rendered_page",
+        "engine": "owc_counter_script_v1",
     }
-
-    return result
 
 
 def refresh_owc_business_rules(
@@ -197,28 +217,62 @@ def refresh_owc_business_rules(
     """
     Hace scraping y luego actualiza courier_business_rules.
     """
-    scraped = scrape_owc_public_rates(region=region)
+    if supabase_client is None:
+        raise RuntimeError("Cliente Supabase no disponible para actualizar tarifas OWC")
+
+    try:
+        scraped = scrape_owc_public_rates(region=region)
+    except Exception as exc:
+        logger.exception("Fallo scraping OWC para %s. Se conservan tarifas existentes.", region)
+        return {
+            "message": "No se actualizaron tarifas OWC; se conservaron las tarifas existentes",
+            "region": region,
+            "error": str(exc),
+            "scraped": {
+                "courier_code": "owc",
+                "url": OWC_TARIFFS_SOURCE_URL,
+                "region": region,
+                "public_rates_available": False,
+            },
+            "saved": {},
+        }
 
     if not scraped["public_rates_available"]:
+        logger.warning(
+            "OWC refresh sin cambios para %s porque el scraping no produjo tarifas completas",
+            region,
+        )
         return {
-            "message": "Proceso de actualización OWC completado sin cambios",
+            "message": "Proceso de actualización OWC completado sin cambios; se conservaron tarifas existentes",
             "scraped": scraped,
             "saved": {},
         }
 
     courier_row = (
         supabase_client
-        .table("couriers")
-        .select("id, code, name")
-        .eq("code", "owc")
-        .single()
+        .table("courier_business_rules")
+        .select("courier_id")
+        .eq("rule_code", "air_base_rate_ves")
+        .limit(1)
         .execute()
     )
 
     if not courier_row.data:
-        raise RuntimeError("No se encontró el courier OWC en la tabla couriers")
+        couriers_result = (
+            supabase_client
+            .table("couriers")
+            .select("id, code, name")
+            .eq("code", "owc")
+            .single()
+            .execute()
+        )
 
-    courier_id = courier_row.data["id"]
+        if not couriers_result.data:
+            raise RuntimeError("No se encontró el courier OWC en la tabla couriers")
+
+        courier_id = couriers_result.data["id"]
+    else:
+        courier_id = courier_row.data[0]["courier_id"]
 
     saved: dict[str, Any] = {}
 
@@ -273,8 +327,7 @@ def refresh_owc_business_rules(
         region_key=region,
     )
 
-    # handling fee normalmente es transversal
-    saved["handling_fee_ves"] = (
+    handling_response = (
         supabase_client
         .table("courier_business_rules")
         .update({
@@ -286,11 +339,10 @@ def refresh_owc_business_rules(
         .execute()
     )
     saved["handling_fee_ves"] = {
-        "updated_count": len(saved["handling_fee_ves"].data) if saved["handling_fee_ves"].data else 0,
-        "data": saved["handling_fee_ves"].data or [],
+        "updated_count": len(handling_response.data) if handling_response.data else 0,
+        "data": handling_response.data or [],
     }
 
-    # mínimos regionales si existen en la tabla
     if scraped["air_min_lb"] is not None:
         saved["air_min_lb"] = _update_rule(
             rule_code="air_min_lb",
