@@ -267,7 +267,7 @@ OWC_SMART_RESTRICTION_CATEGORIES = [
         "terms": [
             "celular", "celulares", "telefono", "teléfono", "telefonos", "teléfonos",
             "smartphone", "iphone", "android", "movil", "móvil", "moviles", "móviles",
-            "samsung", "xiaomi", "motorola", "huawei", "pixel", "oneplus",
+            "phone", "mobile", "samsung", "xiaomi", "motorola", "huawei", "pixel", "oneplus",
         ],
         "db_terms": ["equipos celulares", "celular", "celulares"],
         "examples": ["celular", "iPhone", "teléfono Android", "smartphone"],
@@ -285,7 +285,9 @@ OWC_SMART_RESTRICTION_CATEGORIES = [
         "level_hint": "restricted",
         "terms": [
             "electronico", "electrónico", "electronicos", "electrónicos",
-            "laptop", "laptops", "computadora", "computadoras", "pc", "desktop",
+            "laptop", "laptops", "notebook", "notebooks", "macbook", "macbooks",
+            "computadora", "computadoras", "computador", "computadores", "pc", "desktop",
+            "ordenador", "ordenadores",
             "tablet", "ipad", "consola", "playstation", "ps4", "ps5", "xbox", "nintendo",
             "switch", "audifonos", "audífonos", "camara", "cámara", "smartwatch",
             "reloj inteligente", "monitor", "tarjeta grafica", "tarjeta gráfica", "gpu",
@@ -327,7 +329,8 @@ OWC_SMART_RESTRICTION_CATEGORIES = [
         "level_hint": "restricted",
         "terms": [
             "suplemento", "suplementos", "sumplemento", "sumplementos", "proteina", "proteína",
-            "creatina", "vitamina", "vitaminas", "preworkout", "pre workout", "aminoacido",
+            "creatina", "vitamina", "vitaminas", "vitaminas deportivas", "preworkout",
+            "pre workout", "pre entreno", "aminoacido", "aminoacidos",
             "aminoácido", "bcaa", "colageno", "colágeno", "whey", "mass gainer",
             "quemador", "fat burner",
         ],
@@ -341,18 +344,19 @@ OWC_SMART_RESTRICTION_CATEGORIES = [
         ),
     },
     {
-        "id": "clothing_footwear",
-        "label": "Ropa, calzado y textiles",
+        "id": "clothing",
+        "label": "Ropa y textiles",
         "level_hint": "restricted",
         "terms": [
             "ropa", "textil", "textiles", "jean", "jeans", "pantalon", "pantalón",
-            "pantalones", "camisa", "camisas", "franela", "franelas", "short", "shorts",
-            "vestido", "vestidos", "chaqueta", "chaquetas", "zapato", "zapatos",
-            "tenis", "sneakers", "calzado", "lenceria", "lencería", "linceria",
+            "pantalones", "camisa", "camisas", "camiseta", "camisetas", "franela", "franelas",
+            "prenda", "prendas", "ropa comercial", "short", "shorts",
+            "vestido", "vestidos", "chaqueta", "chaquetas",
+            "lenceria", "lencería", "linceria",
             "ropa interior", "interior", "medias", "gorra", "gorras", "sueter", "suéter",
         ],
-        "db_terms": ["ropa con fines comerciales", "ropa", "calzado"],
-        "examples": ["jeans", "camisas", "zapatos", "franelas", "lencería"],
+        "db_terms": ["ropa con fines comerciales", "ropa"],
+        "examples": ["jeans", "camisas", "franelas", "ropa comercial"],
         "user_message": (
             "La ropa o calzado para uso personal normalmente no implica alerta por sí sola. "
             "La restricción aplica cuando parece carga comercial: muchas piezas iguales, tallas repetidas, alto volumen o reventa."
@@ -360,6 +364,23 @@ OWC_SMART_RESTRICTION_CATEGORIES = [
         "recommendation": (
             "Si es poca cantidad para uso personal, probablemente solo requiere revisión normal. "
             "Si son muchas unidades, tallas repetidas o mercancía para vender, consulta con OWC."
+        ),
+    },
+    {
+        "id": "footwear",
+        "label": "Calzado",
+        "level_hint": "restricted",
+        "terms": [
+            "calzado", "zapato", "zapatos", "tenis", "sneaker", "sneakers",
+            "bota", "botas", "sandalia", "sandalias", "chancleta", "chancletas",
+        ],
+        "db_terms": ["calzado"],
+        "examples": ["zapatos", "tenis", "sneakers", "botas"],
+        "user_message": (
+            "El calzado puede entrar en regimen especial, sobre todo cuando parece mercancia comercial."
+        ),
+        "recommendation": (
+            "Si son varias unidades, tallas repetidas o mercancia para vender, consulta con OWC antes de enviar."
         ),
     },
     {
@@ -584,12 +605,32 @@ def owc_tokens(value: str | None) -> set[str]:
     return {t for t in tokens if t}
 
 
+def owc_category_terms(category: dict) -> list[str]:
+    return category.get("input_terms") or category.get("terms") or []
+
+
+OWC_GENERIC_DB_TERMS = {"similar", "similares"}
+
+
+def owc_query_matches_category_term(query_norm: str, term: str | None) -> bool:
+    term_norm = normalize_owc_search_text(term)
+    if not query_norm or not term_norm:
+        return False
+    query_tokens = owc_tokens(query_norm)
+    term_tokens = owc_tokens(term_norm)
+    if len(query_tokens) > 1 and len(term_tokens) == 1:
+        return False
+    return owc_text_matches(query_norm, term_norm) or owc_text_matches(term_norm, query_norm)
+
+
 def owc_text_matches(text: str | None, term: str | None) -> bool:
     text_norm = normalize_owc_search_text(text)
     term_norm = normalize_owc_search_text(term)
     if not text_norm or not term_norm:
         return False
-    if term_norm in text_norm or text_norm in term_norm:
+    if text_norm == term_norm:
+        return True
+    if (term_norm in text_norm or text_norm in term_norm) and min(len(text_norm), len(term_norm)) >= 3:
         return True
     text_tokens = owc_tokens(text_norm)
     term_tokens = owc_tokens(term_norm)
@@ -603,23 +644,28 @@ def owc_row_haystack(row: dict) -> str:
 def find_owc_query_categories(query: str) -> list[dict]:
     query_norm = normalize_owc_search_text(query)
     query_tokens = owc_tokens(query_norm)
-    categories = []
+    exact_categories = []
+    token_categories = []
     for category in OWC_SMART_ITEM_CATEGORIES:
-        terms = category.get("input_terms", [])
-        if any(owc_text_matches(query_norm, term) or owc_text_matches(term, query_norm) for term in terms):
-            categories.append(category)
+        terms = owc_category_terms(category)
+        if any(owc_query_matches_category_term(query_norm, term) for term in terms):
+            exact_categories.append(category)
             continue
         category_tokens = set()
         for term in terms:
             category_tokens.update(owc_tokens(term))
         if query_tokens and query_tokens.intersection(category_tokens):
-            categories.append(category)
-    return categories
+            token_categories.append(category)
+    return exact_categories or token_categories
 
 
 def owc_row_matches_category(row: dict, category: dict) -> bool:
     haystack = owc_row_haystack(row)
-    return any(owc_text_matches(haystack, term) for term in category.get("db_terms", []))
+    return any(
+        owc_text_matches(haystack, term)
+        for term in category.get("db_terms", [])
+        if normalize_owc_search_text(term) not in OWC_GENERIC_DB_TERMS
+    )
 
 
 def owc_direct_match_score(query: str, row: dict) -> int | None:
@@ -733,7 +779,7 @@ def smart_search_owc_restricted_items(rows: list[dict], query: str, limit: int =
     categories = find_owc_query_categories(query)
     expanded_terms = {normalize_owc_search_text(query)}
     for category in categories:
-        expanded_terms.update(normalize_owc_search_text(term) for term in category.get("input_terms", []))
+        expanded_terms.update(normalize_owc_search_text(term) for term in owc_category_terms(category))
         expanded_terms.update(normalize_owc_search_text(term) for term in category.get("db_terms", []))
     ranked: list[tuple[int, int, str, dict]] = []
     seen: set[str] = set()
