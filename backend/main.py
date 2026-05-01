@@ -1,5 +1,6 @@
-from datetime import datetime
+from datetime import datetime, date, timezone, timedelta
 import logging
+import unicodedata
 from uuid import uuid4
 from typing import Literal
 
@@ -44,6 +45,721 @@ app.add_middleware(
 db_client = supabase_admin or supabase_public
 
 
+BCV_REFRESH_MAX_AGE_HOURS = 6
+OWC_REFRESH_MAX_AGE_HOURS = 6
+OWC_TARIFF_SOURCE_URL = "https://onewaycargo.net/tarifas#calculadora"
+OWC_RESTRICTED_ITEMS_SOURCE_URL = "https://onewaycargo.net/articulos-prohibidos"
+
+OWC_REQUIRED_RULES = [
+    ("air_base_rate_ves", "air", None),
+    ("sea_base_rate_ves", "sea", None),
+    ("correspondence_rate_ves", "correspondence", None),
+    ("handling_fee_ves", "*", "*"),
+]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_iso_datetime(value) -> datetime | None:
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_iso_date(value) -> date | None:
+    if not value:
+        return None
+
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except Exception:
+        return None
+
+
+def is_timestamp_older_than(value, hours: int) -> bool:
+    parsed = parse_iso_datetime(value)
+    if not parsed:
+        return True
+
+    return utc_now() - parsed > timedelta(hours=hours)
+
+
+def get_exchange_fetched_at(row: dict) -> str | None:
+    return row.get("fetched_at") or row.get("updated_at") or row.get("created_at")
+
+
+def should_refresh_exchange_rate(row: dict | None) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+
+    if not row:
+        return True, ["No hay tasa BCV guardada"]
+
+    rate_date = parse_iso_date(row.get("rate_date"))
+    fetched_at = get_exchange_fetched_at(row)
+
+    if not row.get("rate"):
+        reasons.append("La tasa guardada no tiene valor")
+
+    if not rate_date:
+        reasons.append("La tasa guardada no tiene rate_date")
+
+    if not fetched_at:
+        reasons.append("La tasa guardada no tiene fetched_at/updated_at")
+
+    if fetched_at and is_timestamp_older_than(fetched_at, BCV_REFRESH_MAX_AGE_HOURS):
+        reasons.append(f"La tasa fue consultada hace más de {BCV_REFRESH_MAX_AGE_HOURS} horas")
+
+    # El BCV no siempre publica todos los días a la misma hora. Por eso,
+    # si la fecha es anterior a hoy, intentamos refrescar solo si la consulta
+    # guardada no fue reciente.
+    if rate_date and rate_date < date.today() and (
+        not fetched_at or is_timestamp_older_than(fetched_at, 1)
+    ):
+        reasons.append("La fecha de la tasa BCV es anterior a hoy")
+
+    return len(reasons) > 0, reasons
+
+
+def save_bcv_exchange_rate(scraped: dict) -> dict:
+    if db_client is None:
+        raise RuntimeError("Cliente Supabase no disponible para guardar tasa BCV")
+
+    payload = {
+        "source": scraped["source"],
+        "currency_from": scraped["currency_from"],
+        "currency_to": scraped["currency_to"],
+        "rate": scraped["rate"],
+        "rate_date": scraped["rate_date"],
+        "fetched_at": utc_now().isoformat(),
+    }
+
+    result = (
+        db_client
+        .table("exchange_rates")
+        .upsert(
+            payload,
+            on_conflict="source,currency_from,currency_to,rate_date",
+        )
+        .execute()
+    )
+
+    return result.data[0] if result.data else payload
+
+
+def get_latest_exchange_rate_row() -> dict | None:
+    result = (
+        supabase_public
+        .table("exchange_rates")
+        .select("*")
+        .order("rate_date", desc=True)
+        .order("fetched_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    return result.data[0] if result.data else None
+
+
+def get_owc_rule_timestamp(row: dict | None) -> str | None:
+    if not row:
+        return None
+    return row.get("updated_at") or row.get("created_at")
+
+
+def analyze_owc_rules_freshness(
+    rules_rows: list[dict],
+    region: str,
+) -> dict:
+    reasons: list[str] = []
+    timestamps: list[datetime] = []
+
+    for rule_code, service_type_key, explicit_region_key in OWC_REQUIRED_RULES:
+        region_key = explicit_region_key if explicit_region_key is not None else region
+        row = _find_rule_row(
+            rules_rows,
+            rule_code,
+            service_type_key,
+            region_key,
+        )
+
+        if not row:
+            reasons.append(f"Falta regla OWC: {rule_code}")
+            continue
+
+        numeric_value = row.get("numeric_value")
+
+        if numeric_value is None or float(numeric_value) <= 0:
+            reasons.append(f"Regla OWC inválida o en cero: {rule_code}")
+
+        parsed_ts = parse_iso_datetime(get_owc_rule_timestamp(row))
+        if parsed_ts:
+            timestamps.append(parsed_ts)
+        else:
+            reasons.append(f"Regla OWC sin timestamp: {rule_code}")
+
+    oldest_updated_at = min(timestamps) if timestamps else None
+
+    if oldest_updated_at and utc_now() - oldest_updated_at > timedelta(hours=OWC_REFRESH_MAX_AGE_HOURS):
+        reasons.append(f"Tarifario OWC consultado hace más de {OWC_REFRESH_MAX_AGE_HOURS} horas")
+
+    return {
+        "stale": len(reasons) > 0,
+        "reasons": reasons,
+        "oldest_updated_at": oldest_updated_at.isoformat() if oldest_updated_at else None,
+    }
+
+
+def owc_refresh_updated_any_rules(refresh_result: dict | None) -> bool:
+    saved = (refresh_result or {}).get("saved") or {}
+    if not isinstance(saved, dict):
+        return False
+
+    for value in saved.values():
+        if isinstance(value, dict) and int(value.get("updated_count") or 0) > 0:
+            return True
+
+    return False
+
+
+def normalize_search_text(value: str | None) -> str:
+    text = (value or "").strip().lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return " ".join(text.split())
+
+
+def restricted_item_to_response(row: dict, matched_input: str) -> dict:
+    return {
+        "item_name": row.get("item_name") or "",
+        "restriction_level": row.get("restriction_level") or "restricted",
+        "matched_input": matched_input,
+        "reason": row.get("reason"),
+        "notes": row.get("notes"),
+        "source_url": OWC_RESTRICTED_ITEMS_SOURCE_URL,
+        "courier_id": row.get("courier_id"),
+    }
+
+
+# -----------------------------------------------------------------------------
+# OWC intelligent restricted-item search
+# -----------------------------------------------------------------------------
+
+
+OWC_SMART_RESTRICTION_CATEGORIES = [
+    {
+        "id": "cellphones",
+        "label": "Celulares y teléfonos",
+        "level_hint": "restricted",
+        "terms": [
+            "celular", "celulares", "telefono", "teléfono", "telefonos", "teléfonos",
+            "smartphone", "iphone", "android", "movil", "móvil", "moviles", "móviles",
+            "samsung", "xiaomi", "motorola", "huawei", "pixel", "oneplus",
+        ],
+        "db_terms": ["equipos celulares", "celular", "celulares"],
+        "examples": ["celular", "iPhone", "teléfono Android", "smartphone"],
+        "user_message": (
+            "Los celulares nuevos o usados están bajo régimen especial. "
+            "No significa que estén prohibidos automáticamente, pero OWC puede pedir validación previa."
+        ),
+        "recommendation": (
+            "Consulta con OWC antes de enviarlo. Ten factura o comprobante disponible y evita cantidades comerciales."
+        ),
+    },
+    {
+        "id": "electronics_laptops",
+        "label": "Electrónicos, laptops y computadoras",
+        "level_hint": "restricted",
+        "terms": [
+            "electronico", "electrónico", "electronicos", "electrónicos",
+            "laptop", "laptops", "computadora", "computadoras", "pc", "desktop",
+            "tablet", "ipad", "consola", "playstation", "ps4", "ps5", "xbox", "nintendo",
+            "switch", "audifonos", "audífonos", "camara", "cámara", "smartwatch",
+            "reloj inteligente", "monitor", "tarjeta grafica", "tarjeta gráfica", "gpu",
+        ],
+        "db_terms": ["laptops", "laptop", "electrónicos", "electronicos"],
+        "examples": ["laptop", "PC", "tablet", "consola", "audífonos"],
+        "user_message": (
+            "Los electrónicos nuevos o usados están bajo régimen especial. "
+            "El riesgo aumenta si hay varias unidades iguales, alto valor o uso comercial."
+        ),
+        "recommendation": (
+            "Ten factura o comprobante. Si es equipo usado, costoso o son varias unidades, confirma antes con OWC."
+        ),
+    },
+    {
+        "id": "medicines",
+        "label": "Medicamentos, pastillas y tratamientos",
+        "level_hint": "restricted",
+        "terms": [
+            "medicamento", "medicamentos", "medicina", "medicinas", "remedio", "remedios",
+            "pastilla", "pastillas", "pildora", "píldora", "pildoras", "píldoras",
+            "tratamiento", "tratamientos", "jarabe", "antibiotico", "antibiótico",
+            "farmaco", "fármaco", "receta", "prescripcion", "prescripción", "capsula",
+            "cápsula", "capsulas", "cápsulas",
+        ],
+        "db_terms": ["medicamento", "medicamentos"],
+        "examples": ["pastillas", "medicinas", "remedios", "tratamiento"],
+        "user_message": (
+            "Los medicamentos están bajo régimen especial. Pueden requerir validación previa, "
+            "receta, factura o confirmación del courier."
+        ),
+        "recommendation": (
+            "No envíes medicamentos sin confirmar antes con OWC. Indica uso, cantidad, presentación y receta si aplica."
+        ),
+    },
+    {
+        "id": "supplements",
+        "label": "Suplementos deportivos y vitaminas",
+        "level_hint": "restricted",
+        "terms": [
+            "suplemento", "suplementos", "sumplemento", "sumplementos", "proteina", "proteína",
+            "creatina", "vitamina", "vitaminas", "preworkout", "pre workout", "aminoacido",
+            "aminoácido", "bcaa", "colageno", "colágeno", "whey", "mass gainer",
+            "quemador", "fat burner",
+        ],
+        "db_terms": ["suplementos deportivos", "suplementos", "suplemento"],
+        "examples": ["proteína", "creatina", "vitaminas", "preworkout"],
+        "user_message": (
+            "Los suplementos deportivos están bajo régimen especial y pueden requerir validación previa."
+        ),
+        "recommendation": (
+            "Consulta antes con OWC, especialmente si son polvos, cápsulas, varias unidades o productos ingeribles."
+        ),
+    },
+    {
+        "id": "clothing_footwear",
+        "label": "Ropa, calzado y textiles",
+        "level_hint": "restricted",
+        "terms": [
+            "ropa", "textil", "textiles", "jean", "jeans", "pantalon", "pantalón",
+            "pantalones", "camisa", "camisas", "franela", "franelas", "short", "shorts",
+            "vestido", "vestidos", "chaqueta", "chaquetas", "zapato", "zapatos",
+            "tenis", "sneakers", "calzado", "lenceria", "lencería", "linceria",
+            "ropa interior", "interior", "medias", "gorra", "gorras", "sueter", "suéter",
+        ],
+        "db_terms": ["ropa con fines comerciales", "ropa", "calzado"],
+        "examples": ["jeans", "camisas", "zapatos", "franelas", "lencería"],
+        "user_message": (
+            "La ropa o calzado para uso personal normalmente no implica alerta por sí sola. "
+            "La restricción aplica cuando parece carga comercial: muchas piezas iguales, tallas repetidas, alto volumen o reventa."
+        ),
+        "recommendation": (
+            "Si es poca cantidad para uso personal, probablemente solo requiere revisión normal. "
+            "Si son muchas unidades, tallas repetidas o mercancía para vender, consulta con OWC."
+        ),
+    },
+    {
+        "id": "perfumes_cosmetics",
+        "label": "Perfumes, cremas, maquillaje y cosméticos",
+        "level_hint": "mixed",
+        "terms": [
+            "perfume", "perfumes", "colonia", "colonias", "fragancia", "fragancias", "splash",
+            "maquillaje", "cosmetico", "cosmético", "cosmeticos", "cosméticos", "crema",
+            "cremas", "skincare", "labial", "base", "serum", "sérum", "champu", "champú",
+            "shampoo", "locion", "loción", "gel", "tonico", "tónico",
+        ],
+        "db_terms": [
+            "perfumes para uso comercial", "perfumes, cremas", "maquillaje y otros cosméticos",
+            "cosméticos", "cosmeticos", "cremas", "similares",
+        ],
+        "examples": ["perfume", "colonia", "maquillaje", "cremas", "skincare"],
+        "user_message": (
+            "Perfumes, cremas y cosméticos pueden tener tratamiento distinto según sean para uso personal o comercial."
+        ),
+        "recommendation": (
+            "Aclara cantidad y propósito. Para varias unidades o fines comerciales, consulta con OWC antes de enviar."
+        ),
+    },
+    {
+        "id": "beverages_energy",
+        "label": "Bebidas gaseosas y/o energéticas",
+        "level_hint": "restricted",
+        "terms": [
+            "bebida", "bebidas", "gaseosa", "gaseosas", "refresco", "refrescos",
+            "energetica", "energética", "energeticas", "energéticas", "red bull",
+            "monster", "soda", "malta",
+        ],
+        "db_terms": ["bebidas gaseosas", "energéticas", "energeticas"],
+        "examples": ["refrescos", "bebidas energéticas", "soda"],
+        "user_message": (
+            "Las bebidas gaseosas o energéticas están bajo régimen especial y pueden requerir validación previa."
+        ),
+        "recommendation": (
+            "Confirma con OWC cantidad, presentación y condiciones antes de enviar bebidas."
+        ),
+    },
+    {
+        "id": "satellite_telecom",
+        "label": "Equipos y antenas satelitales",
+        "level_hint": "prohibited",
+        "terms": [
+            "satelital", "satelitales", "antena", "antenas", "starlink", "directv",
+            "router satelital", "modem satelital", "módem satelital",
+        ],
+        "db_terms": ["equipos y/o antenas satelitales", "antenas satelitales"],
+        "examples": ["antena satelital", "Starlink", "equipo satelital"],
+        "user_message": "Los equipos o antenas satelitales aparecen como artículos prohibidos.",
+        "recommendation": "No los envíes por OWC sin confirmación oficial explícita.",
+    },
+    {
+        "id": "weapons_security",
+        "label": "Armas, municiones, defensa personal y seguridad",
+        "level_hint": "prohibited",
+        "terms": [
+            "arma", "armas", "pistola", "rifle", "municion", "munición", "municiones",
+            "cuchillo", "cuchillos", "navaja", "navajas", "arma blanca", "armas blancas",
+            "gas pimienta", "pepper spray", "electroshock", "taser", "airsoft",
+            "pistola de aire", "tirolina", "tirolinas", "china", "chinas", "resortera",
+            "machete", "machetes", "mazo", "mazos", "batuta", "batutas", "rolo", "rolos",
+            "arco", "arcos", "flecha", "flechas", "balines", "perdigones",
+        ],
+        "db_terms": [
+            "pistola de aire", "municiones", "tirolinas", "gas pimienta", "machetes",
+            "batutas", "electroshock", "airsoft", "cuchillos", "armas blancas",
+            "arcos y flechas", "armas, explosivos",
+        ],
+        "examples": ["cuchillos", "gas pimienta", "pistola de aire", "airsoft", "machetes"],
+        "user_message": (
+            "Los artículos de armas, municiones, defensa personal o seguridad aparecen como prohibidos."
+        ),
+        "recommendation": "No envíes este tipo de artículos por OWC.",
+    },
+    {
+        "id": "protective_security_gear",
+        "label": "Protección personal, cascos y camuflaje",
+        "level_hint": "prohibited",
+        "terms": [
+            "mascara de gas", "máscara de gas", "chaleco", "chalecos", "antibalas",
+            "bala", "balas", "casco", "cascos", "guante protector", "guantes protectores",
+            "protector", "protectores", "articulos deportivos de proteccion",
+            "artículos deportivos de protección", "camuflaje", "camuflado", "militar",
+        ],
+        "db_terms": [
+            "máscara de gas", "mascara de gas", "chalecos de protección", "artículos de camuflaje",
+            "artículos deportivos de protección", "cascos", "guantes protectores",
+        ],
+        "examples": ["chaleco antibalas", "máscara de gas", "casco", "guantes protectores"],
+        "user_message": "Los artículos de protección personal, camuflaje o seguridad aparecen como prohibidos.",
+        "recommendation": "No los envíes por OWC sin confirmación oficial explícita.",
+    },
+    {
+        "id": "projectiles_small_hard_objects",
+        "label": "Proyectiles, rodamientos, metras y plomos",
+        "level_hint": "prohibited",
+        "terms": [
+            "rodamiento", "rodamientos", "bola de rodamiento", "bolas de rodamientos",
+            "marmol", "mármol", "marmoles", "mármoles", "metra", "metras",
+            "canica", "canicas", "plomo", "plomos", "plomos de pesca", "pesas de pesca",
+        ],
+        "db_terms": ["bolas de rodamientos", "mármoles", "marmoles", "metras", "plomos de pesca"],
+        "examples": ["rodamientos", "metras", "plomos de pesca"],
+        "user_message": "Estos objetos aparecen en la lista de artículos prohibidos de OWC.",
+        "recommendation": "No los envíes por OWC.",
+    },
+    {
+        "id": "chemicals_hazardous",
+        "label": "Químicos, inflamables, explosivos y material peligroso",
+        "level_hint": "prohibited",
+        "terms": [
+            "quimico", "químico", "quimicos", "químicos", "liquido peligroso", "líquido peligroso",
+            "inflamable", "inflamables", "explosivo", "explosivos", "gas", "gases",
+            "polvora", "pólvora", "aerosol", "aerosoles", "fuego artificial", "fuegos artificiales",
+            "petardo", "petardos", "bengala", "bengalas", "radioactivo", "radiactivo",
+            "bateria de carro", "batería de carro", "bateria acido", "batería ácido", "acido", "ácido",
+        ],
+        "db_terms": [
+            "productos químicos líquidos", "armas, explosivos, inflamables, gases y químicos",
+            "fuegos artificiales", "pólvora", "polvora", "bengalas", "material radioactivo",
+            "batería de carros de ácido",
+        ],
+        "examples": ["químicos", "inflamables", "pólvora", "batería de ácido"],
+        "user_message": "Químicos, explosivos, inflamables, gases, material radioactivo o baterías de ácido aparecen como prohibidos.",
+        "recommendation": "No los envíes por OWC.",
+    },
+    {
+        "id": "documents_values_luxury",
+        "label": "Documentos, valores, joyas y obras de arte",
+        "level_hint": "prohibited",
+        "terms": [
+            "pasaporte", "pasaportes", "prorroga", "prórroga", "cedula", "cédula",
+            "documento", "documentos", "identificacion", "identificación", "dinero",
+            "efectivo", "cheque", "cheques", "valor", "valores", "joya", "joyas",
+            "obra de arte", "obras de arte", "arte", "cuadro", "cuadros",
+        ],
+        "db_terms": [
+            "pasaportes", "documentos de identificación", "documentos de identificacion",
+            "valores", "efectivo", "cheques de viajero", "joyas", "obras de arte",
+        ],
+        "examples": ["pasaporte", "cédula", "efectivo", "joyas", "obras de arte"],
+        "user_message": "Documentos personales, valores, efectivo, joyas u obras de arte aparecen como prohibidos.",
+        "recommendation": "No los envíes por OWC sin confirmación oficial explícita.",
+    },
+    {
+        "id": "drones_cameras",
+        "label": "Drones o helicópteros con cámaras",
+        "level_hint": "prohibited",
+        "terms": [
+            "drone", "drones", "helicoptero", "helicóptero", "helicopteros", "helicópteros",
+            "camara drone", "cámara drone", "dji", "mavic", "phantom",
+        ],
+        "db_terms": ["drones", "helicópteros con cámaras", "helicopteros con camaras"],
+        "examples": ["drone", "DJI", "helicóptero con cámara"],
+        "user_message": "Drones o helicópteros con cámaras aparecen como artículos prohibidos.",
+        "recommendation": "No los envíes por OWC.",
+    },
+    {
+        "id": "animals_medical_bio",
+        "label": "Animales, muestras médicas, tejidos y cultivos",
+        "level_hint": "prohibited",
+        "terms": [
+            "animal", "animales", "mascota", "mascotas", "vivo", "vivos", "muerto", "muertos",
+            "muestra medica", "muestra médica", "muestras medicas", "muestras médicas",
+            "tejido", "tejidos", "cultivo", "cultivos", "biologico", "biológico",
+        ],
+        "db_terms": ["animales vivos o muertos", "muestras médicas", "tejidos", "cultivos"],
+        "examples": ["animales", "muestras médicas", "tejidos", "cultivos"],
+        "user_message": "Animales, muestras médicas, tejidos o cultivos aparecen como prohibidos.",
+        "recommendation": "No los envíes por OWC.",
+    },
+    {
+        "id": "adult_drugs_gambling_smuggling",
+        "label": "Contenido adulto, drogas, juegos de azar y contrabando",
+        "level_hint": "prohibited",
+        "terms": [
+            "pornografico", "pornográfico", "porno", "adulto", "estupefaciente", "estupefacientes",
+            "psicotropico", "psicotrópico", "psicotropicos", "psicotrópicos", "droga", "drogas",
+            "marihuana", "cannabis", "cocaina", "cocaína", "azar", "juego de azar",
+            "juegos de azar", "envite", "suerte", "casino", "loteria", "lotería",
+            "contrabando",
+        ],
+        "db_terms": [
+            "material pornográfico", "sustancias estupefacientes", "psicotrópicas",
+            "juegos de suerte", "envite", "azar", "contrabando",
+        ],
+        "examples": ["material pornográfico", "sustancias controladas", "juegos de azar"],
+        "user_message": "Estos artículos aparecen como prohibidos por OWC.",
+        "recommendation": "No los envíes por OWC.",
+    },
+]
+OWC_SMART_ITEM_CATEGORIES = OWC_SMART_RESTRICTION_CATEGORIES
+
+
+def normalize_owc_search_text(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = unicodedata.normalize("NFKD", str(value))
+    without_accents = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    cleaned = without_accents.lower()
+    for char in ["/", "-", "_", ",", ".", "(", ")"]:
+        cleaned = cleaned.replace(char, " ")
+    return " ".join(cleaned.strip().split())
+
+
+def owc_singularize_token(token: str) -> str:
+    token = normalize_owc_search_text(token)
+    if len(token) > 4 and token.endswith("es"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def owc_tokens(value: str | None) -> set[str]:
+    tokens = {t for t in normalize_owc_search_text(value).split() if len(t) >= 2}
+    tokens.update(owc_singularize_token(t) for t in list(tokens))
+    return {t for t in tokens if t}
+
+
+def owc_text_matches(text: str | None, term: str | None) -> bool:
+    text_norm = normalize_owc_search_text(text)
+    term_norm = normalize_owc_search_text(term)
+    if not text_norm or not term_norm:
+        return False
+    if term_norm in text_norm or text_norm in term_norm:
+        return True
+    text_tokens = owc_tokens(text_norm)
+    term_tokens = owc_tokens(term_norm)
+    return bool(term_tokens) and term_tokens.issubset(text_tokens)
+
+
+def owc_row_haystack(row: dict) -> str:
+    return " ".join(normalize_owc_search_text(part) for part in [row.get("item_name"), row.get("restriction_level"), row.get("reason"), row.get("notes")] if part)
+
+
+def find_owc_query_categories(query: str) -> list[dict]:
+    query_norm = normalize_owc_search_text(query)
+    query_tokens = owc_tokens(query_norm)
+    categories = []
+    for category in OWC_SMART_ITEM_CATEGORIES:
+        terms = category.get("input_terms", [])
+        if any(owc_text_matches(query_norm, term) or owc_text_matches(term, query_norm) for term in terms):
+            categories.append(category)
+            continue
+        category_tokens = set()
+        for term in terms:
+            category_tokens.update(owc_tokens(term))
+        if query_tokens and query_tokens.intersection(category_tokens):
+            categories.append(category)
+    return categories
+
+
+def owc_row_matches_category(row: dict, category: dict) -> bool:
+    haystack = owc_row_haystack(row)
+    return any(owc_text_matches(haystack, term) for term in category.get("db_terms", []))
+
+
+def owc_direct_match_score(query: str, row: dict) -> int | None:
+    query_norm = normalize_owc_search_text(query)
+    item_name = normalize_owc_search_text(row.get("item_name"))
+    haystack = owc_row_haystack(row)
+    if not query_norm:
+        return None
+    if owc_text_matches(item_name, query_norm):
+        return 0
+    query_tokens = owc_tokens(query_norm)
+    item_tokens = owc_tokens(item_name)
+    haystack_tokens = owc_tokens(haystack)
+    if query_tokens and query_tokens.issubset(item_tokens):
+        return 1
+    if owc_text_matches(haystack, query_norm):
+        return 2
+    if query_tokens and query_tokens.intersection(item_tokens):
+        return 3
+    if query_tokens and query_tokens.intersection(haystack_tokens):
+        return 4
+    return None
+
+
+def owc_display_level(level: str | None) -> str:
+    normalized = normalize_owc_search_text(level)
+    if normalized in {"prohibited", "prohibido"}:
+        return "Prohibido"
+    if normalized in {"restricted", "restringido", "special_regime", "regimen especial"}:
+        return "Régimen especial"
+    return "Revisar"
+
+
+def owc_action(level: str | None) -> str:
+    normalized = normalize_owc_search_text(level)
+    if normalized in {"prohibited", "prohibido"}:
+        return "block"
+    if normalized in {"restricted", "restringido", "special_regime", "regimen especial"}:
+        return "warn"
+    return "review"
+
+
+def owc_severity_score(level: str | None) -> int:
+    action = owc_action(level)
+    if action == "block":
+        return 100
+    if action == "warn":
+        return 60
+    return 30
+
+
+def owc_default_user_message(row: dict) -> str:
+    item_name = row.get("item_name") or "Este artículo"
+    action = owc_action(row.get("restriction_level"))
+    if action == "block":
+        return f"{item_name} aparece como prohibido en las reglas actuales de OWC."
+    if action == "warn":
+        return f"{item_name} aparece como artículo restringido o bajo régimen especial. Puede requerir validación previa antes del envío."
+    return f"{item_name} requiere revisión manual."
+
+
+def owc_default_recommendation(row: dict) -> str:
+    action = owc_action(row.get("restriction_level"))
+    if action == "block":
+        return "No lo envíes por OWC sin confirmación oficial del courier."
+    if action == "warn":
+        return "Consulta con OWC antes de enviar. Ten factura, descripción del producto y cantidad disponibles."
+    return "Verifica manualmente con OWC si tienes dudas."
+
+
+def build_owc_restricted_item_match(row: dict, query: str, category: dict | None, match_type: str, rank: int) -> dict:
+    level = row.get("restriction_level") or ((category or {}).get("level_hint") or "review")
+    if level == "mixed":
+        level = "restricted"
+    return {
+        "id": row.get("id"),
+        "item_name": row.get("item_name") or (category or {}).get("fallback_item_name") or (category or {}).get("label") or query,
+        "restriction_level": level,
+        "display_level": owc_display_level(level),
+        "action": owc_action(level),
+        "matched_input": query,
+        "match_type": match_type,
+        "confidence": max(30, 100 - (rank * 10)),
+        "category_id": category.get("id") if category else None,
+        "category_label": category.get("label") if category else None,
+        "reason": row.get("reason") or ("Régimen especial" if owc_action(level) == "warn" else "Prohibido por courier" if owc_action(level) == "block" else "Revisión manual"),
+        "notes": row.get("notes") or ("Coincidencia por categoría inteligente" if category else None),
+        "user_message": category.get("user_message") if category else owc_default_user_message(row),
+        "recommendation": category.get("recommendation") if category else owc_default_recommendation(row),
+        "examples": category.get("examples", []) if category else [],
+        "source_url": OWC_RESTRICTED_ITEMS_SOURCE_URL,
+        "courier_id": row.get("courier_id"),
+        "severity_score": owc_severity_score(level),
+    }
+
+
+def build_owc_virtual_match(category: dict, query: str) -> dict:
+    level = category.get("level_hint", "review")
+    if level == "mixed":
+        level = "restricted"
+    return build_owc_restricted_item_match(
+        row={"id": f"virtual:{category['id']}", "item_name": category.get("fallback_item_name") or category.get("label"), "restriction_level": level, "reason": "Coincidencia por categoría inteligente", "notes": "No hubo coincidencia exacta en la tabla; se muestra una advertencia por alias/categoría.", "courier_id": None},
+        query=query,
+        category=category,
+        match_type="virtual_category",
+        rank=5,
+    )
+
+
+def smart_search_owc_restricted_items(rows: list[dict], query: str, limit: int = 10) -> tuple[list[dict], list[dict], list[str]]:
+    categories = find_owc_query_categories(query)
+    expanded_terms = {normalize_owc_search_text(query)}
+    for category in categories:
+        expanded_terms.update(normalize_owc_search_text(term) for term in category.get("input_terms", []))
+        expanded_terms.update(normalize_owc_search_text(term) for term in category.get("db_terms", []))
+    ranked: list[tuple[int, int, str, dict]] = []
+    seen: set[str] = set()
+    for row in rows:
+        row_key = str(row.get("id") or row.get("item_name"))
+        direct_score = owc_direct_match_score(query, row)
+        if direct_score is not None:
+            match = build_owc_restricted_item_match(row=row, query=query, category=None, match_type="direct", rank=direct_score)
+            ranked.append((direct_score, -owc_severity_score(row.get("restriction_level")), row_key, match))
+            seen.add(row_key)
+            continue
+        for category in categories:
+            if row_key in seen or not owc_row_matches_category(row, category):
+                continue
+            match = build_owc_restricted_item_match(row=row, query=query, category=category, match_type="alias_category", rank=2)
+            ranked.append((2, -owc_severity_score(row.get("restriction_level")), row_key, match))
+            seen.add(row_key)
+    if not ranked and categories:
+        for category in categories:
+            match = build_owc_virtual_match(category, query)
+            ranked.append((5, -owc_severity_score(match.get("restriction_level")), f"virtual:{category['id']}", match))
+    ranked.sort(key=lambda item: (item[0], item[1], str(item[3].get("item_name") or "").lower()))
+    category_summaries = [{"id": c["id"], "label": c["label"], "level_hint": c["level_hint"], "examples": c.get("examples", []), "user_message": c.get("user_message"), "recommendation": c.get("recommendation")} for c in categories]
+    return [item[3] for item in ranked[:limit]], category_summaries, sorted(term for term in expanded_terms if term)
+
+
 class UpdateShipmentStatusRequest(BaseModel):
     status: Literal[
         "draft",
@@ -86,20 +802,52 @@ def generate_shipment_code(prefix: str = "QTE") -> str:
     return f"{prefix}-{now}-{short_id}"
 
 
-def get_latest_exchange_rate():
-    result = (
-        supabase_public
-        .table("exchange_rates")
-        .select("*")
-        .order("rate_date", desc=True)
-        .limit(1)
-        .execute()
-    )
+def get_latest_exchange_rate(
+    refresh_if_stale: bool = True,
+    force_refresh: bool = False,
+):
+    latest = get_latest_exchange_rate_row()
 
-    if not result.data:
-        raise HTTPException(status_code=404, detail="No hay tasa de cambio registrada")
+    should_refresh, stale_reasons = should_refresh_exchange_rate(latest)
+    refresh_attempted = False
+    refresh_succeeded = False
+    refresh_error = None
 
-    return result.data[0]
+    if force_refresh or (refresh_if_stale and should_refresh):
+        refresh_attempted = True
+
+        try:
+            scraped = fetch_bcv_usd_rate()
+            latest = save_bcv_exchange_rate(scraped)
+            refresh_succeeded = True
+            should_refresh, stale_reasons = should_refresh_exchange_rate(latest)
+        except Exception as exc:
+            logger.exception("No se pudo refrescar BCV automáticamente")
+            refresh_error = str(exc)
+
+    if not latest:
+        raise HTTPException(
+            status_code=503,
+            detail="No hay tasa BCV guardada y no se pudo refrescar automáticamente",
+        )
+
+    latest = dict(latest)
+    latest["_freshness"] = {
+        "stale": should_refresh,
+        "reasons": stale_reasons,
+        "refresh_attempted": refresh_attempted,
+        "refresh_succeeded": refresh_succeeded,
+        "refresh_error": refresh_error,
+        "message": (
+            "Tasa BCV actualizada automáticamente"
+            if refresh_succeeded
+            else "No se pudo refrescar BCV; se usa la última tasa guardada"
+            if refresh_attempted and refresh_error
+            else "Tasa BCV cargada desde la base de datos"
+        ),
+    }
+
+    return latest
 
 
 def get_courier_by_code(courier_code: str):
@@ -498,9 +1246,34 @@ def build_quote_result(payload):
 
 
 @app.get("/courier-rules/owc")
-def get_owc_rules(region: str = "region_central"):
+def get_owc_rules(
+    region: str = "region_central",
+    refresh_if_stale: bool = False,
+    force: bool = False,
+):
     try:
         courier = get_courier_by_code("owc")
+        rows = get_courier_business_rules(courier["id"])
+        freshness = analyze_owc_rules_freshness(rows, region)
+
+        refresh_attempted = False
+        refresh_succeeded = False
+        refresh_error = None
+        refresh_result = None
+
+        if force or (refresh_if_stale and freshness["stale"]):
+            refresh_attempted = True
+
+            try:
+                refresh_result = refresh_owc_business_rules(db_client, region=region)
+                refresh_succeeded = owc_refresh_updated_any_rules(refresh_result)
+
+                rows = get_courier_business_rules(courier["id"])
+                freshness = analyze_owc_rules_freshness(rows, region)
+            except Exception as exc:
+                logger.exception("No se pudo refrescar OWC automáticamente region=%s", region)
+                refresh_error = str(exc)
+
         rules = build_owc_rules(courier["id"], region)
 
         return {
@@ -508,8 +1281,25 @@ def get_owc_rules(region: str = "region_central"):
             "courier_code": courier["code"],
             "region": region,
             "rules": rules,
+            "freshness": {
+                "stale": bool(freshness["stale"]),
+                "reasons": freshness["reasons"],
+                "oldest_updated_at": freshness["oldest_updated_at"],
+                "refresh_attempted": refresh_attempted,
+                "refresh_succeeded": refresh_succeeded,
+                "refresh_error": refresh_error,
+                "message": (
+                    "Tarifario OWC actualizado automáticamente"
+                    if refresh_succeeded
+                    else "No se pudo refrescar OWC; se usan tarifas guardadas"
+                    if refresh_attempted and refresh_error
+                    else "Tarifario OWC cargado desde la base de datos"
+                ),
+                "refresh_result": refresh_result,
+            },
         }
     except Exception as e:
+        logger.exception("Error obteniendo reglas OWC region=%s", region)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -518,6 +1308,94 @@ def preview_owc_rates(region: str = "region_central"):
     try:
         return scrape_owc_public_rates(region=region)
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/couriers/owc/restricted-items/categories")
+def list_owc_restricted_item_categories():
+    return {
+        "courier_code": "owc",
+        "source_url": OWC_RESTRICTED_ITEMS_SOURCE_URL,
+        "categories": [
+            {
+                "id": category["id"],
+                "label": category["label"],
+                "level_hint": category["level_hint"],
+                "examples": category.get("examples", []),
+                "user_message": category.get("user_message"),
+                "recommendation": category.get("recommendation"),
+            }
+            for category in OWC_SMART_ITEM_CATEGORIES
+        ],
+    }
+
+
+@app.get("/couriers/owc/restricted-items")
+def search_owc_restricted_items(
+    q: str = Query("", min_length=0, max_length=120),
+    limit: int = Query(10, ge=1, le=25),
+):
+    try:
+        query = q.strip()
+        normalized_query = normalize_owc_search_text(query)
+        if not normalized_query:
+            return {
+                "query": q,
+                "normalized_query": "",
+                "courier_code": "owc",
+                "matches": [],
+                "matched_categories": [],
+                "expanded_terms": [],
+                "count": 0,
+                "status": "empty",
+                "message": "Escribe un artículo para verificar si tiene restricciones OWC.",
+                "source_url": OWC_RESTRICTED_ITEMS_SOURCE_URL,
+            }
+
+        courier = get_courier_by_code("owc")
+        result = (
+            (db_client or supabase_public)
+            .table("restricted_items")
+            .select("*")
+            .eq("courier_id", courier["id"])
+            .eq("active", True)
+            .execute()
+        )
+        rows = result.data or []
+        matches, matched_categories, expanded_terms = smart_search_owc_restricted_items(rows=rows, query=query, limit=limit)
+
+        has_prohibited = any(normalize_owc_search_text(m.get("restriction_level")) in {"prohibited", "prohibido"} for m in matches)
+        has_restricted = any(normalize_owc_search_text(m.get("restriction_level")) in {"restricted", "restringido", "special_regime", "regimen especial"} for m in matches)
+
+        if has_prohibited:
+            status = "prohibited"
+            message = "Se encontraron artículos prohibidos relacionados con tu búsqueda. No envíes este artículo sin confirmación oficial de OWC."
+        elif has_restricted:
+            status = "restricted"
+            message = "Se encontraron artículos restringidos o bajo régimen especial. Puede requerir validación previa antes del envío."
+        elif matched_categories:
+            status = "review"
+            message = "La búsqueda coincide con una categoría sensible, pero no se encontró una regla exacta. Revisa la recomendación y confirma con OWC si tienes dudas."
+        else:
+            status = "not_found"
+            message = "No se encontraron restricciones en la base actual. Esto no garantiza que el artículo esté permitido; verifica manualmente si tienes dudas."
+
+        return {
+            "query": query,
+            "normalized_query": normalized_query,
+            "courier_code": "owc",
+            "courier": courier.get("name"),
+            "matches": matches,
+            "matched_categories": matched_categories,
+            "expanded_terms": expanded_terms,
+            "count": len(matches),
+            "status": status,
+            "message": message,
+            "source_url": OWC_RESTRICTED_ITEMS_SOURCE_URL,
+        }
+
+    except Exception as e:
+        logger.exception("Error buscando artículos restringidos OWC q=%s", q)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -531,22 +1409,34 @@ def refresh_owc_rates(region: str = "region_central"):
 
 
 @app.get("/exchange-rate/latest")
-def exchange_rate_latest():
+def exchange_rate_latest(
+    refresh_if_stale: bool = True,
+    force: bool = False,
+):
     try:
-        exchange = get_latest_exchange_rate()
+        exchange = get_latest_exchange_rate(
+            refresh_if_stale=refresh_if_stale,
+            force_refresh=force,
+        )
+        freshness = exchange.get("_freshness", {})
+
         return {
             "source": exchange["source"],
             "currency_from": exchange["currency_from"],
             "currency_to": exchange["currency_to"],
             "rate": float(exchange["rate"]),
             "rate_date": exchange["rate_date"],
-            "fetched_at": exchange["fetched_at"],
+            "fetched_at": get_exchange_fetched_at(exchange),
+            "stale": bool(freshness.get("stale", False)),
+            "freshness": freshness,
+            "message": freshness.get("message"),
         }
     except HTTPException:
         raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception("Error obteniendo tasa BCV")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -554,26 +1444,7 @@ def exchange_rate_latest():
 def refresh_bcv_exchange_rate():
     try:
         scraped = fetch_bcv_usd_rate()
-
-        payload = {
-            "source": scraped["source"],
-            "currency_from": scraped["currency_from"],
-            "currency_to": scraped["currency_to"],
-            "rate": scraped["rate"],
-            "rate_date": scraped["rate_date"],
-        }
-
-        result = (
-            db_client
-            .table("exchange_rates")
-            .upsert(
-                payload,
-                on_conflict="source,currency_from,currency_to,rate_date",
-            )
-            .execute()
-        )
-
-        saved_row = result.data[0] if result.data else payload
+        saved_row = save_bcv_exchange_rate(scraped)
 
         return {
             "message": "Tasa BCV actualizada correctamente",
@@ -582,6 +1453,7 @@ def refresh_bcv_exchange_rate():
         }
 
     except Exception as e:
+        logger.exception("Error refrescando tasa BCV")
         raise HTTPException(status_code=500, detail=str(e))
 
 
