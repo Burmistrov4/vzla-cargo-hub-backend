@@ -356,10 +356,8 @@ def calculate_zoom_quote(
         raise ValueError("Zoom Casillero v1 solo soporta entrega en oficina")
     if shipment_kind != "merchandise":
         raise ValueError("Zoom Casillero v1 solo soporta mercancia")
-    if consolidated and consolidated_package_count < 2:
-        raise ValueError("Si consolidated=true, consolidated_package_count debe ser al menos 2")
-    if consolidated and consolidated_package_count != 2:
-        raise ValueError("Zoom Casillero v1 solo tiene validado consolidado con 2 encomiendas")
+    if consolidated and not 2 <= consolidated_package_count <= 10:
+        raise ValueError("Zoom Casillero permite consolidar entre 2 y 10 encomiendas.")
 
     air_rate_usd_per_kg = d(rules.get("air_rate_usd_per_kg", "32.40"))
     protection_percent = d(rules.get("protection_percent", "0.01"))
