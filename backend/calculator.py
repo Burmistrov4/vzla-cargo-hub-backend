@@ -721,20 +721,28 @@ def calculate_owc_quote(
         compactation_fee_usd = ZERO
         compactation_fee_ves = ZERO
 
-    total_usd_exact = (
-        freight_usd
-        + insurance_usd
-        + customs_tax_usd
-        + handling_usd
-        + packaging_usd
-        + repack_usd
-        + storage_usd
-        + purchase_service_usd
-        + compactation_fee_usd
-    )
+    freight_ves_rounded = round_ves(freight_ves)
+    insurance_ves_rounded = round_ves(insurance_ves)
+    customs_tax_ves_rounded = round_ves(customs_tax_ves)
+    handling_ves_rounded = round_ves(handling_ves)
+    packaging_ves_rounded = round_ves(packaging_ves)
+    repack_ves_rounded = round_ves(repack_ves)
+    storage_ves_rounded = round_ves(storage_ves)
+    purchase_service_ves_rounded = round_ves(purchase_service_ves)
+    compactation_fee_ves_rounded = round_ves(compactation_fee_ves)
 
-    total_usd = round_usd(total_usd_exact)
-    total_ves = round_ves(d(total_usd) * bcv) if bcv > 0 else 0
+    total_ves = (
+        freight_ves_rounded
+        + handling_ves_rounded
+        + insurance_ves_rounded
+        + customs_tax_ves_rounded
+        + repack_ves_rounded
+        + storage_ves_rounded
+        + purchase_service_ves_rounded
+        + compactation_fee_ves_rounded
+        + packaging_ves_rounded
+    )
+    total_usd = round_usd(d(total_ves) / bcv) if bcv > 0 else 0
 
     sea_freight_reference_ves = sea_base_rate_ves * (
         raw_volume_ft3 if raw_volume_ft3 >= sea_min_ft3 else sea_min_ft3
@@ -791,23 +799,23 @@ def calculate_owc_quote(
         },
         "breakdown": {
             "freight_usd": round_usd(freight_usd),
-            "freight_ves": round_ves(freight_ves),
+            "freight_ves": freight_ves_rounded,
             "insurance_usd": round_usd(insurance_usd),
-            "insurance_ves": round_ves(insurance_ves),
+            "insurance_ves": insurance_ves_rounded,
             "customs_tax_usd": round_usd(customs_tax_usd),
-            "customs_tax_ves": round_ves(customs_tax_ves),
+            "customs_tax_ves": customs_tax_ves_rounded,
             "handling_usd": round_usd(handling_usd),
-            "handling_ves": round_ves(handling_ves),
+            "handling_ves": handling_ves_rounded,
             "packaging_usd": round_usd(packaging_usd),
-            "packaging_ves": round_ves(packaging_ves),
+            "packaging_ves": packaging_ves_rounded,
             "repack_usd": round_usd(repack_usd),
-            "repack_ves": round_ves(repack_ves),
+            "repack_ves": repack_ves_rounded,
             "storage_usd": round_usd(storage_usd),
-            "storage_ves": round_ves(storage_ves),
+            "storage_ves": storage_ves_rounded,
             "purchase_service_usd": round_usd(purchase_service_usd),
-            "purchase_service_ves": round_ves(purchase_service_ves),
+            "purchase_service_ves": purchase_service_ves_rounded,
             "compactation_fee_usd": round_usd(compactation_fee_usd),
-            "compactation_fee_ves": round_ves(compactation_fee_ves),
+            "compactation_fee_ves": compactation_fee_ves_rounded,
         },
         "total_usd": total_usd,
         "total_ves": total_ves,
