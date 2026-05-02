@@ -4,7 +4,7 @@ import unicodedata
 from uuid import uuid4
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -17,11 +17,30 @@ from backend.calculator import (
 from backend.bcv_scraper import fetch_bcv_usd_rate
 from backend.owc_scraper import scrape_owc_public_rates, refresh_owc_business_rules
 from backend.models import (
+    AdminUserCreateRequest,
+    AdminUserStatusRequest,
+    AdminUserUpdateRequest,
+    AdminUsersResponse,
+    AuthLoginRequest,
+    AuthLoginResponse,
+    AuthMessageResponse,
+    AuthUserResponse,
     QuoteCalculateRequest,
     QuoteCalculateResponse,
     QuoteSaveRequest,
     QuoteSaveResponse,
     RestrictedItemMatch,
+)
+from backend.auth_utils import (
+    env_flag_enabled,
+    generate_session_token,
+    get_session_hours,
+    hash_password,
+    normalize_username,
+    parse_datetime,
+    seed_token_matches,
+    utc_now as auth_utc_now,
+    verify_password,
 )
 
 logger = logging.getLogger(__name__)
@@ -819,6 +838,297 @@ class UpdateShipmentStatusRequest(BaseModel):
     tracking_internal: str | None = None
     tracking_external: str | None = None
     notes: str | None = None
+
+
+# -----------------------------------------------------------------------------
+# Authentication / users for WinForms client
+# -----------------------------------------------------------------------------
+
+
+def require_auth_db_client():
+    """Return the privileged Supabase client required for server-side auth."""
+    if supabase_admin is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Autenticación no disponible: configura SUPABASE_SERVICE_ROLE_KEY "
+                "solo en el backend/servidor. Nunca la incluyas en la WinApp."
+            ),
+        )
+    return supabase_admin
+
+
+def auth_user_response(row: dict) -> AuthUserResponse:
+    return AuthUserResponse(
+        id=str(row.get("id")),
+        username=row.get("username") or "",
+        display_name=row.get("display_name") or row.get("username") or "Usuario",
+        role=row.get("role") or "operador",
+        is_active=bool(row.get("is_active", True)),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+        last_login_at=row.get("last_login_at"),
+    )
+
+
+def get_app_user_by_username(username: str) -> dict | None:
+    client = require_auth_db_client()
+    normalized = normalize_username(username)
+    result = (
+        client
+        .table("app_users")
+        .select("*")
+        .eq("username", normalized)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def get_app_user_by_id(user_id: str) -> dict | None:
+    client = require_auth_db_client()
+    result = (
+        client
+        .table("app_users")
+        .select("*")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def create_session_for_user(user_id: str) -> dict:
+    client = require_auth_db_client()
+    created_at = auth_utc_now()
+    expires_at = created_at + timedelta(hours=get_session_hours())
+    payload = {
+        "user_id": user_id,
+        "token": generate_session_token(),
+        "created_at": created_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    result = client.table("app_sessions").insert(payload).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="No se pudo crear sesión")
+    return result.data[0]
+
+
+def extract_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Token de autorización requerido")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Formato de autorización inválido")
+
+    return token.strip()
+
+
+def get_current_app_user(authorization: str | None = Header(default=None)) -> dict:
+    client = require_auth_db_client()
+    token = extract_bearer_token(authorization)
+
+    session_result = (
+        client
+        .table("app_sessions")
+        .select("*")
+        .eq("token", token)
+        .limit(1)
+        .execute()
+    )
+
+    if not session_result.data:
+        raise HTTPException(status_code=401, detail="Sesión inválida")
+
+    session = session_result.data[0]
+    if session.get("revoked_at"):
+        raise HTTPException(status_code=401, detail="Sesión cerrada")
+
+    expires_at = parse_datetime(session.get("expires_at"))
+    if not expires_at or expires_at <= auth_utc_now():
+        raise HTTPException(status_code=401, detail="Sesión expirada")
+
+    user = get_app_user_by_id(str(session.get("user_id")))
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuario no encontrado")
+
+    if not bool(user.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="Usuario inactivo")
+
+    user["_session_token"] = token
+    return user
+
+
+def require_admin_user(current_user: dict = Depends(get_current_app_user)) -> dict:
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Requiere perfil Admin")
+    return current_user
+
+
+def upsert_dev_user(username: str, display_name: str, password: str, role: str) -> dict:
+    client = require_auth_db_client()
+    normalized = normalize_username(username)
+    now_iso = auth_utc_now().isoformat()
+    existing = get_app_user_by_username(normalized)
+    payload = {
+        "username": normalized,
+        "display_name": display_name,
+        "password_hash": hash_password(password),
+        "role": role,
+        "is_active": True,
+        "updated_at": now_iso,
+    }
+
+    if existing:
+        result = (
+            client
+            .table("app_users")
+            .update(payload)
+            .eq("id", existing["id"])
+            .execute()
+        )
+        return result.data[0] if result.data else {**existing, **payload}
+
+    payload["created_at"] = now_iso
+    result = client.table("app_users").insert(payload).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail=f"No se pudo crear usuario {normalized}")
+    return result.data[0]
+
+
+@app.post("/auth/dev-seed", response_model=AuthMessageResponse)
+def auth_dev_seed(x_seed_token: str | None = Header(default=None)):
+    if not env_flag_enabled("ENABLE_DEV_AUTH_SEED"):
+        raise HTTPException(
+            status_code=403,
+            detail="Seed de desarrollo deshabilitado. Activa ENABLE_DEV_AUTH_SEED=true solo en local.",
+        )
+
+    if not seed_token_matches(x_seed_token):
+        raise HTTPException(status_code=403, detail="X-Seed-Token inválido")
+
+    upsert_dev_user("admin", "Administrador", "admin123", "admin")
+    upsert_dev_user("operador", "Operador", "operador123", "operador")
+
+    return AuthMessageResponse(
+        ok=True,
+        message="Usuarios temporales de desarrollo creados/actualizados en Supabase",
+    )
+
+
+@app.post("/auth/login", response_model=AuthLoginResponse)
+def auth_login(payload: AuthLoginRequest):
+    user = get_app_user_by_username(payload.username)
+
+    if not user or not verify_password(payload.password, user.get("password_hash")):
+        raise HTTPException(status_code=401, detail="Usuario o contraseña incorrectos")
+
+    if not bool(user.get("is_active", True)):
+        raise HTTPException(status_code=403, detail="Usuario inactivo")
+
+    session = create_session_for_user(str(user["id"]))
+
+    now_iso = auth_utc_now().isoformat()
+    require_auth_db_client().table("app_users").update({"last_login_at": now_iso, "updated_at": now_iso}).eq("id", user["id"]).execute()
+    user["last_login_at"] = now_iso
+    user["updated_at"] = now_iso
+
+    return AuthLoginResponse(
+        access_token=session["token"],
+        expires_at=session["expires_at"],
+        user=auth_user_response(user),
+    )
+
+
+@app.get("/auth/me", response_model=AuthUserResponse)
+def auth_me(current_user: dict = Depends(get_current_app_user)):
+    return auth_user_response(current_user)
+
+
+@app.post("/auth/logout", response_model=AuthMessageResponse)
+def auth_logout(current_user: dict = Depends(get_current_app_user)):
+    token = current_user.get("_session_token")
+    require_auth_db_client().table("app_sessions").update({"revoked_at": auth_utc_now().isoformat()}).eq("token", token).execute()
+    return AuthMessageResponse(ok=True, message="Sesión cerrada correctamente")
+
+
+@app.get("/admin/users", response_model=AdminUsersResponse)
+def admin_list_users(_: dict = Depends(require_admin_user)):
+    result = (
+        require_auth_db_client()
+        .table("app_users")
+        .select("id,username,display_name,role,is_active,created_at,updated_at,last_login_at")
+        .order("created_at", desc=False)
+        .execute()
+    )
+    users = [auth_user_response(row) for row in (result.data or [])]
+    return AdminUsersResponse(count=len(users), data=users)
+
+
+@app.post("/admin/users", response_model=AuthUserResponse)
+def admin_create_user(payload: AdminUserCreateRequest, _: dict = Depends(require_admin_user)):
+    client = require_auth_db_client()
+    normalized = normalize_username(payload.username)
+
+    if get_app_user_by_username(normalized):
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese nombre")
+
+    now_iso = auth_utc_now().isoformat()
+    insert_payload = {
+        "username": normalized,
+        "display_name": payload.display_name,
+        "password_hash": hash_password(payload.password),
+        "role": payload.role,
+        "is_active": payload.is_active,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    result = client.table("app_users").insert(insert_payload).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="No se pudo crear el usuario")
+    return auth_user_response(result.data[0])
+
+
+@app.put("/admin/users/{user_id}", response_model=AuthUserResponse)
+def admin_update_user(user_id: str, payload: AdminUserUpdateRequest, _: dict = Depends(require_admin_user)):
+    client = require_auth_db_client()
+    existing = get_app_user_by_id(user_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    update_payload = payload.model_dump(exclude_unset=True, exclude_none=True)
+    password = update_payload.pop("password", None)
+    if password:
+        update_payload["password_hash"] = hash_password(password)
+
+    if not update_payload:
+        return auth_user_response(existing)
+
+    update_payload["updated_at"] = auth_utc_now().isoformat()
+    result = client.table("app_users").update(update_payload).eq("id", user_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="No se pudo actualizar el usuario")
+    return auth_user_response(result.data[0])
+
+
+@app.patch("/admin/users/{user_id}/status", response_model=AuthUserResponse)
+def admin_update_user_status(user_id: str, payload: AdminUserStatusRequest, _: dict = Depends(require_admin_user)):
+    client = require_auth_db_client()
+    existing = get_app_user_by_id(user_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    result = (
+        client
+        .table("app_users")
+        .update({"is_active": payload.is_active, "updated_at": auth_utc_now().isoformat()})
+        .eq("id", user_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=500, detail="No se pudo actualizar el estado")
+    return auth_user_response(result.data[0])
 
 
 @app.get("/")

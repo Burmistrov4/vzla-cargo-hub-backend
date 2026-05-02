@@ -114,3 +114,71 @@ class QuoteSaveResponse(BaseModel):
     exchange_rate_used: float
     restricted_matches: list[RestrictedItemMatch]
     quote: dict
+
+
+# -----------------------------------------------------------------------------
+# Authentication / users for WinForms client
+# -----------------------------------------------------------------------------
+
+UserRole = Literal["admin", "operador"]
+
+
+class AuthLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    username: str = Field(..., min_length=3, max_length=60)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class AuthUserResponse(BaseModel):
+    id: str
+    username: str
+    display_name: str
+    role: UserRole
+    is_active: bool = True
+    created_at: str | None = None
+    updated_at: str | None = None
+    last_login_at: str | None = None
+
+
+class AuthLoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: str
+    user: AuthUserResponse
+
+
+class AuthMessageResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+class AdminUserCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    username: str = Field(..., min_length=3, max_length=60)
+    display_name: str = Field(..., min_length=2, max_length=120)
+    password: str = Field(..., min_length=6, max_length=128)
+    role: UserRole = "operador"
+    is_active: bool = True
+
+
+class AdminUserUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    display_name: str | None = Field(default=None, min_length=2, max_length=120)
+    password: str | None = Field(default=None, min_length=6, max_length=128)
+    role: UserRole | None = None
+    is_active: bool | None = None
+
+
+class AdminUserStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    is_active: bool
+
+
+class AdminUsersResponse(BaseModel):
+    count: int
+    data: list[AuthUserResponse]
+
