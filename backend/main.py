@@ -1131,6 +1131,41 @@ def admin_update_user_status(user_id: str, payload: AdminUserStatusRequest, _: d
     return auth_user_response(result.data[0])
 
 
+@app.delete("/admin/users/{user_id}", response_model=AuthMessageResponse)
+def admin_delete_user(user_id: str, current_user: dict = Depends(require_admin_user)):
+    client = require_auth_db_client()
+    existing = get_app_user_by_id(user_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    if str(existing.get("id")) == str(current_user.get("id")):
+        raise HTTPException(status_code=400, detail="No puedes eliminar tu propio usuario desde la sesión actual")
+
+    existing_role = str(existing.get("role") or "").lower()
+    existing_active = bool(existing.get("is_active"))
+    if existing_role == "admin" and existing_active:
+        active_admins = (
+            client
+            .table("app_users")
+            .select("id")
+            .eq("role", "admin")
+            .eq("is_active", True)
+            .execute()
+        )
+        if len(active_admins.data or []) <= 1:
+            raise HTTPException(status_code=400, detail="No puedes eliminar el último usuario Admin activo")
+
+    # Revoca sesiones explícitamente antes de borrar. La FK también puede hacer cascade,
+    # pero esto evita que queden tokens activos si la política de BD cambia.
+    client.table("app_sessions").delete().eq("user_id", user_id).execute()
+    client.table("app_users").delete().eq("id", user_id).execute()
+
+    if get_app_user_by_id(user_id):
+        raise HTTPException(status_code=500, detail="No se pudo eliminar el usuario")
+
+    return AuthMessageResponse(ok=True, message="Usuario eliminado correctamente")
+
+
 @app.get("/")
 def root():
     return {"message": "API operativa"}
