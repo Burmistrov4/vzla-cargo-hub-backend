@@ -517,6 +517,7 @@ def calculate_owc_quote(
 
     enable_handling_fee = bool(payload.get("enable_handling_fee", True))
     enable_repack_fee = bool(payload.get("enable_repack_fee", False))
+    repack_prealert_valid = bool(payload.get("repack_prealert_valid", False))
     compactation_requested = bool(payload.get("compactation_requested", False))
 
     hold_mode = payload.get("hold_mode", "none")
@@ -532,6 +533,10 @@ def calculate_owc_quote(
         if storage_fee_ves_per_day_ft3_override is not None
         else d(rules.get("storage_fee_ves_per_day_ft3", 0))
     )
+    storage_fee_usd_per_day_ft3 = d(rules.get("storage_fee_usd_per_day_ft3", 0))
+    storage_fee_currency = (rules.get("storage_fee_currency") or "VES").upper()
+    if storage_fee_currency == "USD" and storage_fee_usd_per_day_ft3 <= 0:
+        storage_fee_usd_per_day_ft3 = storage_fee_ves_per_day_ft3
 
     air_base_rate_ves = d(rules.get("air_base_rate_ves", 0))
     sea_base_rate_ves = d(rules.get("sea_base_rate_ves", 0))
@@ -560,7 +565,7 @@ def calculate_owc_quote(
     provisional_customs_qty_threshold = int(rules.get("provisional_customs_qty_threshold", 4))
     provisional_customs_value_threshold_usd = d(rules.get("provisional_customs_value_threshold_usd", 200))
 
-    storage_charge_min_ft3 = d(rules.get("storage_charge_min_ft3", 1))
+    storage_charge_min_ft3 = d(rules.get("storage_charge_min_ft3", 0))
 
     total_weight_lb = derive_weight_lb(
         total_weight_lb=total_weight_lb_input,
@@ -588,6 +593,7 @@ def calculate_owc_quote(
         raw_volumetric_lb = (length_in * width_in * height_in) / volumetric_divisor_in3_per_lb
 
     display_volume_ft3 = round_int_half_up(raw_volume_ft3)
+    sea_freight_volume_ft3 = raw_volume_ft3  # volumen real sin redondear, igual que raw_volume_ft3
 
     charge_unit = "lb"
     chargeable_exact = ZERO
@@ -629,7 +635,7 @@ def calculate_owc_quote(
         chargeable_exact = raw_volume_ft3
         chargeable_display = display_volume_ft3
 
-        billable_ft3 = raw_volume_ft3
+        billable_ft3 = sea_freight_volume_ft3
         if billable_ft3 <= 0 or billable_ft3 < sea_min_ft3:
             billable_ft3 = sea_min_ft3
             uses_minimum_charge = True
@@ -651,16 +657,21 @@ def calculate_owc_quote(
         handling_ves = handling_fee_ves_rule * d(tracking_count)
     handling_usd = (handling_ves / bcv) if bcv > 0 else ZERO
 
-    repack_applies = False
-    if enable_repack_fee:
-        if service_type == "air":
-            repack_applies = chargeable_exact >= repack_min_air_lb
-        elif service_type == "sea":
-            repack_applies = max(raw_volume_ft3, sea_min_ft3) >= repack_min_sea_ft3
+    repack_eligible = False
+    if service_type == "air":
+        air_repack_weight_lb = (
+            chargeable_exact if air_basis == "real_exact" else d(chargeable_display)
+        )
+        repack_eligible = air_repack_weight_lb >= repack_min_air_lb
+    elif service_type == "sea":
+        repack_eligible = d(display_volume_ft3) >= repack_min_sea_ft3
+
+    repack_fee_applied = enable_repack_fee and repack_eligible
+    repack_applies = repack_fee_applied
 
     repack_usd = ZERO
     repack_ves = ZERO
-    if repack_applies and repack_fee_amount > 0:
+    if repack_fee_applied and repack_fee_amount > 0:
         if repack_fee_currency == "USD":
             repack_usd = repack_fee_amount
             repack_ves = repack_usd * bcv
@@ -698,9 +709,18 @@ def calculate_owc_quote(
     if hold_mode in {"general", "repack"} and hold_days > general_hold_free_business_days:
         storage_days_charged = hold_days - general_hold_free_business_days
 
+    storage_exemption_applied = False
+    storage_exemption_reason = "none"
+    if hold_mode == "repack":
+        if repack_prealert_valid and repack_storage_exempt:
+            storage_exemption_applied = True
+            storage_exemption_reason = "valid_repack_prealert"
+        else:
+            storage_exemption_reason = "missing_valid_repack_prealert"
+
     storage_chargeable_ft3 = ZERO
     if storage_days_charged > 0:
-        if hold_mode == "repack" and repack_applies and repack_storage_exempt:
+        if storage_exemption_applied:
             storage_days_charged = 0
         else:
             storage_chargeable_ft3 = (
@@ -709,8 +729,14 @@ def calculate_owc_quote(
                 else storage_charge_min_ft3
             )
 
-    storage_ves = storage_chargeable_ft3 * storage_fee_ves_per_day_ft3 * d(storage_days_charged)
-    storage_usd = (storage_ves / bcv) if bcv > 0 else ZERO
+    storage_usd = ZERO
+    storage_ves = ZERO
+    if storage_fee_currency == "USD" and storage_fee_usd_per_day_ft3 > 0:
+        storage_usd = storage_chargeable_ft3 * storage_fee_usd_per_day_ft3 * d(storage_days_charged)
+        storage_ves = storage_usd * bcv
+    elif storage_fee_currency == "VES" and storage_fee_ves_per_day_ft3 > 0:
+        storage_ves = storage_chargeable_ft3 * storage_fee_ves_per_day_ft3 * d(storage_days_charged)
+        storage_usd = (storage_ves / bcv) if bcv > 0 else ZERO
 
     compactation_fee_usd = ZERO
     compactation_fee_ves = ZERO
@@ -767,7 +793,11 @@ def calculate_owc_quote(
             "volumetric_weight_lb": round_usd(raw_volumetric_lb),
             "raw_volume_ft3": round_usd(raw_volume_ft3),
             "display_volume_ft3": display_volume_ft3,
+            "sea_freight_volume_ft3": float(sea_freight_volume_ft3),
             "storage_chargeable_ft3": round_usd(storage_chargeable_ft3),
+            "storage_charge_min_ft3": round_usd(storage_charge_min_ft3),
+            "storage_fee_usd_per_day_ft3": round_usd(storage_fee_usd_per_day_ft3),
+            "storage_fee_ves_per_day_ft3": round_usd(storage_fee_ves_per_day_ft3),
             "length_in_used": round_usd(length_in),
             "width_in_used": round_usd(width_in),
             "height_in_used": round_usd(height_in),
@@ -775,16 +805,31 @@ def calculate_owc_quote(
         "flags": {
             "enable_handling_fee": enable_handling_fee,
             "enable_repack_fee": enable_repack_fee,
+            "repack_prealert_valid": repack_prealert_valid,
             "compactation_requested": compactation_requested,
             "hold_mode": hold_mode,
             "hold_days": hold_days,
             "storage_days_charged": storage_days_charged,
+            "storage_exemption_applied": storage_exemption_applied,
+            "storage_exemption_reason": storage_exemption_reason,
+            "general_hold_free_business_days": general_hold_free_business_days,
+            "storage_fee_currency": storage_fee_currency,
+            "storage_fee_usd_per_day_ft3": float(storage_fee_usd_per_day_ft3),
+            "storage_fee_ves_per_day_ft3": float(storage_fee_ves_per_day_ft3),
+            "storage_charge_min_ft3": float(storage_charge_min_ft3),
+            "storage_estimated": True,
             "use_insurance": use_insurance,
             "use_purchase_by_order": use_purchase_by_order,
             "apply_provisional_customs": apply_provisional_customs,
             "repack_applies": repack_applies,
+            "repack_eligible": repack_eligible,
+            "repack_fee_applied": repack_fee_applied,
+            "repack_min_air_lb": float(repack_min_air_lb),
+            "repack_min_sea_ft3": float(repack_min_sea_ft3),
             "repack_storage_exempt": repack_storage_exempt,
             "air_basis": air_basis,
+            "freight_basis": "sea_freight_volume_ft3" if service_type == "sea" else air_basis,
+            "freight_rounding_mode": "no_rounding_raw_volume_ft3" if service_type == "sea" else "exact",
         },
         "public_calculator_reference": {
             "air_final_weight_display_lb": round_int_half_up(

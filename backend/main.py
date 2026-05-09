@@ -74,6 +74,8 @@ OWC_REQUIRED_RULES = [
     ("sea_base_rate_ves", "sea", None),
     ("correspondence_rate_ves", "correspondence", None),
     ("handling_fee_ves", "*", "*"),
+    ("general_hold_free_business_days", "*", "*"),
+    ("storage_charge_min_ft3", "*", "*"),
 ]
 
 
@@ -1480,8 +1482,47 @@ def get_rule_bool(
     return bool(row["bool_value"])
 
 
+def get_rule_text(
+    rules_rows: list[dict],
+    rule_code: str,
+    service_type_key: str = "*",
+    region_key: str = "*",
+    default: str = "",
+):
+    row = _find_rule_row(rules_rows, rule_code, service_type_key, region_key)
+    if not row:
+        return default
+
+    for key in ("text_value", "string_value", "value", "currency_code"):
+        value = row.get(key)
+        if value:
+            return str(value)
+
+    return default
+
+
 def build_owc_rules(courier_id: str, region: str):
     rows = get_courier_business_rules(courier_id)
+    storage_fee_usd_per_day_ft3 = get_rule_number(
+        rows, "storage_fee_usd_per_day_ft3", "*", "*", 0
+    )
+    storage_fee_ves_per_day_ft3 = get_rule_number(
+        rows, "storage_fee_ves_per_day_ft3", "*", "*", 0
+    )
+    explicit_storage_currency = get_rule_text(
+        rows, "storage_fee_currency", "*", "*", ""
+    ).upper()
+    storage_ves_row = _find_rule_row(rows, "storage_fee_ves_per_day_ft3", "*", "*") or {}
+
+    if storage_fee_usd_per_day_ft3 > 0:
+        storage_fee_currency = "USD"
+    elif explicit_storage_currency in {"USD", "VES"}:
+        storage_fee_currency = explicit_storage_currency
+    elif 0 < storage_fee_ves_per_day_ft3 <= 50:
+        storage_fee_currency = "USD"
+        storage_fee_usd_per_day_ft3 = storage_fee_ves_per_day_ft3
+    else:
+        storage_fee_currency = str(storage_ves_row.get("currency_code") or "VES").upper()
 
     return {
         "air_base_rate_ves": get_rule_number(rows, "air_base_rate_ves", "air", region, 4248),
@@ -1501,14 +1542,16 @@ def build_owc_rules(courier_id: str, region: str):
         "repack_storage_exempt": get_rule_bool(rows, "repack_storage_exempt", "*", "*", True),
         "insurance_percent": get_rule_number(rows, "insurance_percent", "*", "*", 0.05),
         "general_hold_free_business_days": int(get_rule_number(rows, "general_hold_free_business_days", "*", "*", 3)),
-        "storage_fee_ves_per_day_ft3": get_rule_number(rows, "storage_fee_ves_per_day_ft3", "*", "*", 0),
+        "storage_fee_usd_per_day_ft3": storage_fee_usd_per_day_ft3,
+        "storage_fee_ves_per_day_ft3": storage_fee_ves_per_day_ft3,
+        "storage_fee_currency": storage_fee_currency,
         "purchase_by_order_threshold_usd": get_rule_number(rows, "purchase_by_order_threshold_usd", "*", "*", 100),
         "purchase_by_order_lt_threshold_percent": get_rule_number(rows, "purchase_by_order_lt_threshold_percent", "*", "*", 0.20),
         "purchase_by_order_gte_threshold_percent": get_rule_number(rows, "purchase_by_order_gte_threshold_percent", "*", "*", 0.15),
         "provisional_customs_percent": get_rule_number(rows, "provisional_customs_percent", "*", "*", 0.16),
         "provisional_customs_qty_threshold": int(get_rule_number(rows, "provisional_customs_qty_threshold", "*", "*", 4)),
         "provisional_customs_value_threshold_usd": get_rule_number(rows, "provisional_customs_value_threshold_usd", "*", "*", 200),
-        "storage_charge_min_ft3": get_rule_number(rows, "storage_charge_min_ft3", "*", "*", 1),
+        "storage_charge_min_ft3": get_rule_number(rows, "storage_charge_min_ft3", "*", "*", 0),
     }
 
 

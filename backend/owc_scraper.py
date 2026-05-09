@@ -286,10 +286,7 @@ def refresh_owc_business_rules(
         query = (
             supabase_client
             .table("courier_business_rules")
-            .update({
-                "numeric_value": numeric_value,
-                "currency_code": currency_code,
-            })
+            .select("id")
             .eq("courier_id", courier_id)
             .eq("rule_code", rule_code)
         )
@@ -300,7 +297,34 @@ def refresh_owc_business_rules(
         if region_key is not None:
             query = query.eq("region_key", region_key)
 
-        response = query.execute()
+        existing = query.execute()
+        if existing.data:
+            update_query = (
+                supabase_client
+                .table("courier_business_rules")
+                .update({
+                    "numeric_value": numeric_value,
+                    "currency_code": currency_code,
+                })
+                .eq("id", existing.data[0]["id"])
+            )
+            response = update_query.execute()
+        else:
+            insert_query = (
+                supabase_client
+                .table("courier_business_rules")
+                .insert({
+                    "courier_id": courier_id,
+                    "rule_code": rule_code,
+                    "numeric_value": numeric_value,
+                    "currency_code": currency_code,
+                    "service_type_key": service_type_key,
+                    "region_key": region_key,
+                    "active": True
+                })
+            )
+            response = insert_query.execute()
+
         return {
             "updated_count": len(response.data) if response.data else 0,
             "data": response.data or [],
@@ -327,21 +351,12 @@ def refresh_owc_business_rules(
         region_key=region,
     )
 
-    handling_response = (
-        supabase_client
-        .table("courier_business_rules")
-        .update({
-            "numeric_value": scraped["handling_fee_ves"],
-            "currency_code": "VES",
-        })
-        .eq("courier_id", courier_id)
-        .eq("rule_code", "handling_fee_ves")
-        .execute()
+    saved["handling_fee_ves"] = _update_rule(
+        rule_code="handling_fee_ves",
+        numeric_value=scraped["handling_fee_ves"],
+        service_type_key="*",
+        region_key="*",
     )
-    saved["handling_fee_ves"] = {
-        "updated_count": len(handling_response.data) if handling_response.data else 0,
-        "data": handling_response.data or [],
-    }
 
     if scraped["air_min_lb"] is not None:
         saved["air_min_lb"] = _update_rule(

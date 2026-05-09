@@ -29,6 +29,14 @@ CASES = [
         "expected_total_usd": 48.40,
     },
     {
+        "name": "1 kg / USD 1000 / consolidado 10",
+        "weight_kg": 1,
+        "declared_value_usd": 1000,
+        "consolidated": True,
+        "count": 10,
+        "expected_total_usd": 48.40,
+    },
+    {
         "name": "5 kg / USD 1000 / no consolidado",
         "weight_kg": 5,
         "declared_value_usd": 1000,
@@ -86,6 +94,25 @@ CASES = [
     },
 ]
 
+INVALID_CASES = [
+    {
+        "name": "1 kg / USD 1000 / consolidado 1",
+        "weight_kg": 1,
+        "declared_value_usd": 1000,
+        "consolidated": True,
+        "count": 1,
+        "expected_error": "Zoom Casillero permite consolidar entre 2 y 10 encomiendas.",
+    },
+    {
+        "name": "1 kg / USD 1000 / consolidado 11",
+        "weight_kg": 1,
+        "declared_value_usd": 1000,
+        "consolidated": True,
+        "count": 11,
+        "expected_error": "Zoom Casillero permite consolidar entre 2 y 10 encomiendas.",
+    },
+]
+
 
 def build_payload(case):
     return {
@@ -137,6 +164,21 @@ def main():
             f"consolidation={breakdown['consolidation_usd']:.2f} | "
             f"total={actual:.2f} | expected={expected:.2f} | diff={diff:+.2f}"
         )
+
+    for case in INVALID_CASES:
+        try:
+            calculate_zoom_quote(RULES, EXCHANGE_RATE, build_payload(case))
+        except ValueError as exc:
+            message = str(exc)
+            ok = message == case["expected_error"]
+            failed += 0 if ok else 1
+            print(
+                f"{'OK' if ok else 'FAIL'} | {case['name']} | "
+                f"error={message}"
+            )
+        else:
+            failed += 1
+            print(f"FAIL | {case['name']} | expected validation error")
 
     if failed:
         raise SystemExit(f"{failed} Zoom cases failed")

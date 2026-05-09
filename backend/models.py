@@ -55,6 +55,7 @@ class QuoteCalculateRequest(BaseModel):
 
     enable_handling_fee: bool = True
     enable_repack_fee: bool = False
+    repack_prealert_valid: bool = False
     compactation_requested: bool = False
 
     hold_mode: HoldModeType = "none"
@@ -181,4 +182,3 @@ class AdminUserStatusRequest(BaseModel):
 class AdminUsersResponse(BaseModel):
     count: int
     data: list[AuthUserResponse]
-
