@@ -652,9 +652,27 @@ def calculate_owc_quote(
 
     freight_usd = (freight_ves / bcv) if bcv > 0 else ZERO
 
+    original_tracking_count = max(int(tracking_count or 1), 1)
+
+    prealert_repack_confirmed = (
+        hold_mode in {"prealertar_hold", "repack"}
+        and bool(repack_prealert_valid)
+    )
+
+    handling_consolidated_by_repack_prealert = (
+        bool(enable_handling_fee)
+        and bool(enable_repack_fee)
+        and prealert_repack_confirmed
+        and original_tracking_count >= 2
+    )
+
+    effective_handling_count = (
+        1 if handling_consolidated_by_repack_prealert else original_tracking_count
+    )
+
     handling_ves = ZERO
     if enable_handling_fee and handling_fee_ves_rule > 0:
-        handling_ves = handling_fee_ves_rule * d(tracking_count)
+        handling_ves = handling_fee_ves_rule * d(effective_handling_count)
     handling_usd = (handling_ves / bcv) if bcv > 0 else ZERO
 
     repack_eligible = False
@@ -711,6 +729,7 @@ def calculate_owc_quote(
 
     storage_exemption_applied = False
     storage_exemption_reason = "none"
+    hold_extension_warning = (hold_mode == "repack" and hold_days > 5)
     if hold_mode == "repack":
         if repack_prealert_valid and repack_storage_exempt:
             storage_exemption_applied = True
@@ -801,6 +820,9 @@ def calculate_owc_quote(
             "length_in_used": round_usd(length_in),
             "width_in_used": round_usd(width_in),
             "height_in_used": round_usd(height_in),
+            "original_tracking_count": original_tracking_count,
+            "effective_handling_count": effective_handling_count,
+            "hold_validity_business_days": 5,
         },
         "flags": {
             "enable_handling_fee": enable_handling_fee,
@@ -809,6 +831,9 @@ def calculate_owc_quote(
             "compactation_requested": compactation_requested,
             "hold_mode": hold_mode,
             "hold_days": hold_days,
+            "hold_extension_warning": hold_extension_warning,
+            "handling_consolidated_by_repack_prealert": handling_consolidated_by_repack_prealert,
+            "repack_fee_is_single_charge": True,
             "storage_days_charged": storage_days_charged,
             "storage_exemption_applied": storage_exemption_applied,
             "storage_exemption_reason": storage_exemption_reason,
