@@ -414,7 +414,7 @@ def calculate_zoom_quote(
         )
     protection_ves = protection_usd * bcv
 
-    consolidation_usd = consolidation_fee_usd if consolidated else ZERO
+    consolidation_usd = (d(consolidated_package_count) * d("3.00")) if consolidated else ZERO
     consolidation_ves = consolidation_usd * bcv
 
     total_usd = freight_usd + protection_usd + consolidation_usd
