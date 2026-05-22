@@ -4,9 +4,14 @@ import unicodedata
 from uuid import uuid4
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, File, Form, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import os
+import smtplib
+from email.message import EmailMessage
+import time
+from typing import List, Optional
 
 from backend.supabase_client import supabase_admin, supabase_public
 from backend.calculator import (
@@ -2296,3 +2301,159 @@ def quote_calculate_and_save(payload: QuoteSaveRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Rate limit en memoria para feedback (almacena lista de timestamps por IP)
+FEEDBACK_RATE_LIMIT = {}
+
+def send_feedback_email(subject: str, text_content: str, files_data: list):
+    email_mode = os.getenv("FEEDBACK_EMAIL_MODE", "smtp")
+    if email_mode == "console":
+        logger.info(f"--- FEEDBACK RECIBIDO (CONSOLE MODE) ---\nSubject: {subject}\n{text_content}")
+        return
+
+    smtp_server = os.getenv("SMTP_SERVER")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    smtp_from = os.getenv("SMTP_FROM_EMAIL", smtp_user)
+    feedback_to = os.getenv("FEEDBACK_TO_EMAIL", "lorenzoroca333@gmail.com")
+
+    if not smtp_server or not smtp_user or not smtp_password:
+        raise Exception("El servicio de feedback no está configurado correctamente.")
+
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = smtp_from
+    msg['To'] = feedback_to
+    msg.set_content(text_content)
+
+    for fdata in files_data:
+        msg.add_attachment(
+            fdata['content'],
+            maintype=fdata['maintype'],
+            subtype=fdata['subtype'],
+            filename=fdata['filename']
+        )
+
+    with smtplib.SMTP(smtp_server, smtp_port) as server:
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.send_message(msg)
+
+@app.post("/feedback")
+async def handle_feedback(
+    request: Request,
+    request_type: str = Form(...),
+    name: Optional[str] = Form(None),
+    email: Optional[str] = Form(None),
+    message: str = Form(...),
+    honeypot: Optional[str] = Form(None),
+    files: List[UploadFile] = File([])
+):
+    if honeypot:
+        # Honeypot lleno, simular exito para bots
+        return {"message": "Sugerencia enviada correctamente."}
+    
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    
+    rate_limit_disabled = os.getenv("FEEDBACK_RATE_LIMIT_DISABLED", "false").lower() == "true"
+    rate_limit_seconds = int(os.getenv("FEEDBACK_RATE_LIMIT_SECONDS", "60"))
+    rate_limit_max = int(os.getenv("FEEDBACK_RATE_LIMIT_MAX", "3"))
+    
+    if not rate_limit_disabled:
+        if len(FEEDBACK_RATE_LIMIT) > 1000:
+            stale_keys = [k for k, v in FEEDBACK_RATE_LIMIT.items() if not v or (now - v[-1]) > rate_limit_seconds]
+            for k in stale_keys:
+                del FEEDBACK_RATE_LIMIT[k]
+                
+        timestamps = FEEDBACK_RATE_LIMIT.get(ip, [])
+        timestamps = [t for t in timestamps if now - t < rate_limit_seconds]
+        
+        if len(timestamps) >= rate_limit_max:
+            wait_time = int(rate_limit_seconds - (now - timestamps[0]))
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Demasiadas peticiones. Intenta en {wait_time} segundos.",
+                headers={"Retry-After": str(wait_time)}
+            )
+        FEEDBACK_RATE_LIMIT[ip] = timestamps
+    
+    if len(message) < 15 or len(message) > 7000:
+        raise HTTPException(status_code=400, detail="El mensaje debe tener entre 15 y 7000 caracteres.")
+    
+    if len(files) > 7:
+        raise HTTPException(status_code=400, detail="Máximo 7 archivos permitidos.")
+        
+    allowed_extensions = {".png", ".jpg", ".jpeg", ".webp", ".pdf", ".xls", ".xlsx", ".csv"}
+    forbidden_extensions = {".zip", ".rar", ".7z", ".exe", ".bat", ".cmd", ".js", ".sh", ".php", ".html", ".svg"}
+    
+    total_size = 0
+    files_data = []
+    
+    for f in files:
+        if not f.filename:
+            continue
+            
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext in forbidden_extensions or ext not in allowed_extensions:
+            raise HTTPException(status_code=400, detail=f"Extensión no permitida o peligrosa: {ext}")
+            
+        content = await f.read()
+        size = len(content)
+        if size > 8 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"El archivo {f.filename} supera los 8MB permitidos.")
+            
+        total_size += size
+        if total_size > 20 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="El tamaño total de archivos supera los 20MB permitidos.")
+            
+        mime_type = f.content_type or "application/octet-stream"
+        maintype, _, subtype = mime_type.partition("/")
+        if not maintype or not subtype:
+            maintype, subtype = "application", "octet-stream"
+            
+        clean_filename = "".join(c for c in f.filename if c.isalnum() or c in " ._-")
+        if not clean_filename:
+            clean_filename = "attachment" + ext
+            
+        files_data.append({
+            "content": content,
+            "maintype": maintype,
+            "subtype": subtype,
+            "filename": clean_filename,
+            "size": size
+        })
+        
+    safe_type = "".join(request_type.splitlines())
+    safe_name = "".join((name or "N/A").splitlines())
+    safe_email = "".join((email or "N/A").splitlines())
+    
+    text_content = f"Tipo de solicitud: {safe_type}\n"
+    text_content += f"Nombre: {safe_name}\n"
+    text_content += f"Correo: {safe_email}\n"
+    text_content += f"Fecha/Hora: {datetime.now(timezone.utc).isoformat()}\n"
+    text_content += f"User Agent: {request.headers.get('user-agent', 'N/A')}\n\n"
+    text_content += f"Mensaje:\n{message}\n\n"
+    
+    if files_data:
+        text_content += "Adjuntos:\n"
+        for fd in files_data:
+            text_content += f"- {fd['filename']} ({fd['size']} bytes, {fd['maintype']}/{fd['subtype']})\n"
+            
+    subject = f"Nuevo Feedback Vzla Cargo: {safe_type}"
+    
+    try:
+        send_feedback_email(subject, text_content, files_data)
+    except Exception as e:
+        logger.error(f"Error enviando email de feedback: {e}")
+        err_msg = str(e)
+        if "no está configurado correctamente" in err_msg:
+            raise HTTPException(status_code=503, detail="El servicio de feedback no está configurado correctamente.")
+        raise HTTPException(status_code=503, detail="El servicio de sugerencias no está disponible en este momento.")
+
+    if not rate_limit_disabled:
+        timestamps.append(now)
+        FEEDBACK_RATE_LIMIT[ip] = timestamps
+
+    return {"message": "Sugerencia enviada correctamente."}
