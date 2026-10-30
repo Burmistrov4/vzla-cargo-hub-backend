@@ -11,7 +11,9 @@ import os
 import smtplib
 from email.message import EmailMessage
 import time
+import asyncio
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from backend.supabase_client import supabase_admin, supabase_public
 from backend.calculator import (
@@ -1178,6 +1180,12 @@ def root():
     return {"message": "API operativa"}
 
 
+@app.get("/health")
+def health():
+    """Lightweight health-check endpoint for keep-alive pings."""
+    return {"status": "ok"}
+
+
 @app.get("/test-db")
 def test_db():
     try:
@@ -2304,22 +2312,34 @@ def quote_calculate_and_save(payload: QuoteSaveRequest):
 
 # Rate limit en memoria para feedback (almacena lista de timestamps por IP)
 FEEDBACK_RATE_LIMIT = {}
+_smtp_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="smtp")
 
-def send_feedback_email(subject: str, text_content: str, files_data: list):
+def _send_email_sync(subject: str, text_content: str, files_data: list):
+    """Envía el correo de forma síncrona (se ejecuta en ThreadPoolExecutor)."""
     email_mode = os.getenv("FEEDBACK_EMAIL_MODE", "smtp")
     if email_mode == "console":
         logger.info(f"--- FEEDBACK RECIBIDO (CONSOLE MODE) ---\nSubject: {subject}\n{text_content}")
         return
 
     smtp_server = os.getenv("SMTP_SERVER")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_port_str = os.getenv("SMTP_PORT", "587")
     smtp_user = os.getenv("SMTP_USER")
     smtp_password = os.getenv("SMTP_PASSWORD")
     smtp_from = os.getenv("SMTP_FROM_EMAIL", smtp_user)
     feedback_to = os.getenv("FEEDBACK_TO_EMAIL", "lorenzoroca333@gmail.com")
 
-    if not smtp_server or not smtp_user or not smtp_password:
-        raise Exception("El servicio de feedback no está configurado correctamente.")
+    missing = []
+    if not smtp_server: missing.append("SMTP_SERVER")
+    if not smtp_user: missing.append("SMTP_USER")
+    if not smtp_password: missing.append("SMTP_PASSWORD")
+    if not smtp_from: missing.append("SMTP_FROM_EMAIL")
+    if missing:
+        raise Exception(f"El servicio de feedback no está configurado correctamente (faltan: {', '.join(missing)}).")
+
+    try:
+        smtp_port = int(smtp_port_str)
+    except ValueError:
+        raise Exception("El puerto SMTP_PORT debe ser numérico.")
 
     msg = EmailMessage()
     msg['Subject'] = subject
@@ -2335,10 +2355,45 @@ def send_feedback_email(subject: str, text_content: str, files_data: list):
             filename=fdata['filename']
         )
 
-    with smtplib.SMTP(smtp_server, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+            logger.info(f"Feedback enviado exitosamente a {feedback_to}")
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"SMTP Auth Error: {e} - Usuario: {smtp_user}")
+        raise Exception(f"Autenticación SMTP fallida. Verifica SMTP_USER y SMTP_PASSWORD (usa App Password de Google, no contraseña normal).")
+    except smtplib.SMTPConnectError as e:
+        logger.error(f"SMTP Connect Error: {e} - Servidor: {smtp_server}:{smtp_port}")
+        raise Exception(f"No se pudo conectar al servidor SMTP {smtp_server}:{smtp_port}.")
+    except smtplib.SMTPServerDisconnected as e:
+        logger.error(f"SMTP Disconnected: {e}")
+        raise Exception("El servidor SMTP cerró la conexión inesperadamente.")
+    except TimeoutError:
+        logger.error(f"SMTP Timeout: Servidor {smtp_server}:{smtp_port} no respondió en 15s")
+        raise Exception("Timeout al conectar con el servidor SMTP. El servicio puede estar bloqueado por el hosting.")
+    except OSError as e:
+        logger.error(f"SMTP OS Error ({type(e).__name__}): {e} - Servidor: {smtp_server}:{smtp_port}")
+        raise Exception(f"Error de red al conectar con SMTP: {type(e).__name__}")
+    except Exception as e:
+        logger.error(f"SMTP Error ({type(e).__name__}): {e} - Servidor: {smtp_server}:{smtp_port}, Usuario: {smtp_user}")
+        raise Exception(f"Fallo en la conexión o autenticación SMTP: {type(e).__name__}")
+
+
+async def send_feedback_email(subject: str, text_content: str, files_data: list):
+    """Wrapper async que ejecuta el envío SMTP en un thread con timeout de 20s."""
+    loop = asyncio.get_event_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(_smtp_executor, _send_email_sync, subject, text_content, files_data),
+            timeout=20.0
+        )
+    except asyncio.TimeoutError:
+        logger.error("send_feedback_email: asyncio timeout (20s)")
+        raise Exception("El envío del correo tardó demasiado. El servidor SMTP no respondió a tiempo.")
 
 @app.post("/feedback")
 async def handle_feedback(
@@ -2444,13 +2499,17 @@ async def handle_feedback(
     subject = f"Nuevo Feedback Vzla Cargo: {safe_type}"
     
     try:
-        send_feedback_email(subject, text_content, files_data)
+        await send_feedback_email(subject, text_content, files_data)
     except Exception as e:
-        logger.error(f"Error enviando email de feedback: {e}")
         err_msg = str(e)
-        if "no está configurado correctamente" in err_msg:
-            raise HTTPException(status_code=503, detail="El servicio de feedback no está configurado correctamente.")
-        raise HTTPException(status_code=503, detail="El servicio de sugerencias no está disponible en este momento.")
+        logger.error(f"Error al procesar sugerencia: {err_msg}")
+        if "no está configurado" in err_msg:
+            raise HTTPException(status_code=503, detail=err_msg)
+        if "Autenticación SMTP fallida" in err_msg:
+            raise HTTPException(status_code=503, detail="Error de autenticación del servicio de correo. Contacta al administrador.")
+        if "Timeout" in err_msg or "tardó demasiado" in err_msg:
+            raise HTTPException(status_code=504, detail="El servidor de correo no respondió a tiempo. Intenta de nuevo.")
+        raise HTTPException(status_code=503, detail=f"No se pudo enviar el correo: {err_msg}")
 
     if not rate_limit_disabled:
         timestamps.append(now)
